@@ -126,15 +126,30 @@ missing (e.g. the pbxproj was reverted):
 ### Auto-rebuild on every Xcode build (recommended)
 
 To avoid having to remember `scripts/build-rust.sh` after editing Rust
-sources, add a Run Script build phase that does it for you. Once-off
-setup:
+sources, set up a **separate aggregate target** that runs the script,
+then make `FlashReader` depend on it. Why aggregate-target rather than
+a build phase on `FlashReader` itself: putting the script inside
+`FlashReader` creates a dependency cycle — `ProcessXCFramework`
+consumes `Vendor/RustImportCore.xcframework` as input to the same
+target whose script phase produces it, and Xcode refuses with
+`error: Cycle inside FlashReader; building could produce unreliable
+results`. Splitting into two targets breaks the cycle by giving Xcode
+an explicit "build this first" edge.
 
-1. Project → **FlashReader target** → **Build Phases** → **+** →
-   **New Run Script Phase**
-2. Drag the new phase to the **top** of the list (must run before
-   *Compile Sources* / *Link Binary*).
-3. Name it `Build RustImportCore` (double-click the phase title).
-4. Script body:
+Once-off setup:
+
+1. **Create the aggregate target.**
+   File → **New** → **Target…** → search "Aggregate" (under
+   Cross-platform / Other) → **Next**.
+   Product Name: `RustImportCore`. Project: `FlashReader`. Click
+   **Finish**.
+
+2. **Add the run-script phase to it.**
+   Project navigator → `FlashReader` project → select the new
+   `RustImportCore` aggregate target → **Build Phases** → **+** →
+   **New Run Script Phase**. Name it `Build RustImportCore`.
+
+3. **Script body:**
    ```sh
    if [ "$ACTION" = "indexbuild" ]; then exit 0; fi
    "${SRCROOT}/scripts/build-rust.sh" "${CONFIGURATION:-Debug}"
@@ -142,7 +157,8 @@ setup:
    The first line skips the script during Xcode's background
    indexing builds, which would otherwise spawn cargo for every
    index update.
-5. Expand **Input Files** and add (one per line):
+
+4. **Input Files** (one per line):
    ```
    $(SRCROOT)/Vendor/RustImportCore/Cargo.toml
    $(SRCROOT)/Vendor/RustImportCore/Cargo.lock
@@ -150,17 +166,30 @@ setup:
    $(SRCROOT)/Vendor/RustImportCore/cbindgen.toml
    $(SRCROOT)/Vendor/RustImportCore/src/lib.rs
    ```
-6. Expand **Output Files** and add:
+
+5. **Output Files:**
    ```
    $(SRCROOT)/Vendor/RustImportCore.xcframework/Info.plist
    ```
-7. ⌥-click the disclosure triangle on the phase to enable
-   **"Based on dependency analysis"** (it should be on by default).
+   Output Files are safe here — they live on a different target than
+   the one consuming the xcframework, so no cycle.
+
+6. **Make FlashReader depend on it.**
+   Select the `FlashReader` target → **Build Phases** → **Target
+   Dependencies** → **+** → pick `RustImportCore` → **Add**.
+
+7. **Update the scheme.**
+   Product → **Scheme** → **Edit Scheme…** → **Build** →
+   confirm both `RustImportCore` and `FlashReader` are listed; if
+   only `FlashReader` is there, click **+** and add
+   `RustImportCore` above it. (Xcode usually adds it automatically
+   when you wire the dependency, but sometimes doesn't.)
 
 Behaviour after this is wired:
 
-- **No Rust changes** → Xcode skips the phase entirely (Input Files
-  unchanged vs. Output Files). Zero overhead.
+- **No Rust changes** → Xcode skips the aggregate target's script
+  phase entirely (Input Files unchanged vs. Output Files). Zero
+  overhead.
 - **Touched but unchanged Rust source** → script's internal
   fast-skip exits in ~12 ms (compares Info.plist mtime against
   newest source mtime).
@@ -168,9 +197,24 @@ Behaviour after this is wired:
   is ~10–30 s warm; release is slower because of LTO (~2–3 min)
   and only matters for archives.
 
-If you don't want this, just remove the phase — manual
+If you don't want this, just remove the aggregate target — manual
 `scripts/build-rust.sh` from the terminal still works exactly as
 before.
+
+### Common mistake: putting the script on `FlashReader` directly
+
+If you (or Xcode AI assistance) put the Run Script phase on the
+`FlashReader` target with the same Output Files, every build fails
+with:
+
+```
+error: Cycle inside FlashReader; building could produce unreliable results.
+Cycle details:
+→ Command: ProcessXCFramework /…/Vendor/RustImportCore.xcframework …
+○ That command depends on command in Target 'FlashReader': script phase "Build RustImportCore"
+```
+
+Move the phase to the aggregate target as described above.
 
 ## FFI surface
 
