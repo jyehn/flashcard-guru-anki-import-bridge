@@ -19,6 +19,8 @@
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::decks::DeckId;
+use anki::notes::NoteId;
+use anki::search::SearchNode;
 use anki::version;
 use anki_proto::import_export::ImportAnkiPackageOptions;
 
@@ -88,8 +90,21 @@ pub struct DeckList {
     pub(crate) names: Vec<CString>,
 }
 
+/// One row inside a `NoteList`. Strings are owned `CString`s so the
+/// indexed accessor pointers stay valid until the list is freed.
+pub(crate) struct NoteRow {
+    pub(crate) id: u64,
+    pub(crate) notetype_id: u64,
+    pub(crate) fields: Vec<CString>,
+    pub(crate) tags: Vec<CString>,
+}
+
+/// Snapshot of notes inside a deck (or all notes if the caller passed
+/// `deck_id = 0`). Materialised eagerly: enumerate_notes locks the
+/// Collection once, fetches every note, and converts to row-oriented
+/// `CString`s so the FFI accessors never re-lock or re-allocate.
 pub struct NoteList {
-    pub _ids: Vec<i64>,
+    pub(crate) rows: Vec<NoteRow>,
 }
 
 pub struct RenderedCard {
@@ -341,21 +356,178 @@ pub unsafe extern "C" fn flashify_decks_name_at(list: *const DeckList, idx: u64)
     list.names.get(idx as usize).map_or(ptr::null(), |s| s.as_ptr())
 }
 
-/// Enumerate notes for a specific deck (or all notes if `deck_id` is 0).
-/// TODO(PR 3b.3): use `col.search_notes_unordered` or
-/// `col.storage.all_notes_in_decks([deck_id])`.
+/// Enumerate notes for a specific deck. Pass `deck_id = 0` for all notes
+/// regardless of deck. Returns NULL on failure; check
+/// `flashify_last_error_message`.
+///
+/// Order: by note id ascending. rslib's underlying calls return either
+/// a HashSet (no order) or a search result (search-mode order); we
+/// sort here so callers get a stable iteration order across runs.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_enumerate_notes(
-    _pkg: *mut OpenedPackage,
-    _deck_id: u64,
+    pkg: *mut OpenedPackage,
+    deck_id: u64,
 ) -> *mut NoteList {
-    Box::into_raw(Box::new(NoteList { _ids: Vec::new() }))
+    if pkg.is_null() {
+        set_last_error("flashify_enumerate_notes: null pkg");
+        return ptr::null_mut();
+    }
+    let pkg_ref = &*pkg;
+    let mut col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_enumerate_notes: collection mutex poisoned");
+            return ptr::null_mut();
+        }
+    };
+
+    let mut note_ids: Vec<NoteId> = if deck_id == 0 {
+        match col.storage.get_all_note_ids() {
+            Ok(set) => set.into_iter().collect(),
+            Err(e) => {
+                set_last_error_from("flashify_enumerate_notes: get_all_note_ids", e);
+                return ptr::null_mut();
+            }
+        }
+    } else {
+        let did = DeckId(deck_id as i64);
+        match col.search_notes_unordered(SearchNode::DeckIdWithChildren(did)) {
+            Ok(ids) => ids,
+            Err(e) => {
+                set_last_error_from("flashify_enumerate_notes: search_notes_unordered", e);
+                return ptr::null_mut();
+            }
+        }
+    };
+    note_ids.sort_unstable_by_key(|nid| nid.0);
+
+    let mut rows: Vec<NoteRow> = Vec::with_capacity(note_ids.len());
+    for nid in note_ids {
+        let note = match col.storage.get_note(nid) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue, // gone between the search and the fetch — silently skip
+            Err(e) => {
+                set_last_error_from("flashify_enumerate_notes: get_note", e);
+                return ptr::null_mut();
+            }
+        };
+        let fields: Vec<CString> = note
+            .fields()
+            .iter()
+            .map(|f| CString::new(f.replace('\0', "")).unwrap_or_default())
+            .collect();
+        let tags: Vec<CString> = note
+            .tags
+            .iter()
+            .map(|t| CString::new(t.replace('\0', "")).unwrap_or_default())
+            .collect();
+        rows.push(NoteRow {
+            id: note.id.0 as u64,
+            notetype_id: note.notetype_id.0 as u64,
+            fields,
+            tags,
+        });
+    }
+
+    Box::into_raw(Box::new(NoteList { rows }))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn flashify_free_notes(notes: *mut NoteList) {
     if !notes.is_null() {
         drop(Box::from_raw(notes));
+    }
+}
+
+/// Number of notes in the list, or -1 if `list` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_count(list: *const NoteList) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    let list = &*list;
+    list.rows.len() as i64
+}
+
+/// Note id at the given index, or 0 if out of range / null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_id_at(list: *const NoteList, idx: u64) -> u64 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(0, |r| r.id)
+}
+
+/// Notetype (model) id at the given index.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_notetype_id_at(list: *const NoteList, idx: u64) -> u64 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(0, |r| r.notetype_id)
+}
+
+/// Number of fields on the note at the given index, -1 on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_field_count_at(list: *const NoteList, idx: u64) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(-1, |r| r.fields.len() as i64)
+}
+
+/// Field text at (note index, field index). Pointer valid until
+/// `flashify_free_notes`. NULL on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_field_at(
+    list: *const NoteList,
+    idx: u64,
+    field_idx: u64,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    match list.rows.get(idx as usize) {
+        Some(row) => row
+            .fields
+            .get(field_idx as usize)
+            .map_or(ptr::null(), |s| s.as_ptr()),
+        None => ptr::null(),
+    }
+}
+
+/// Number of tags on the note at the given index, -1 on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_tag_count_at(list: *const NoteList, idx: u64) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(-1, |r| r.tags.len() as i64)
+}
+
+/// Tag at (note index, tag index). Pointer valid until
+/// `flashify_free_notes`. NULL on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_tag_at(
+    list: *const NoteList,
+    idx: u64,
+    tag_idx: u64,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    match list.rows.get(idx as usize) {
+        Some(row) => row
+            .tags
+            .get(tag_idx as usize)
+            .map_or(ptr::null(), |s| s.as_ptr()),
+        None => ptr::null(),
     }
 }
 
