@@ -4316,6 +4316,10 @@ dependencies = [
  "anki",
  "anki_proto",
  "cbindgen",
+ "fsrs",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

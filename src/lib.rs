@@ -23,6 +23,8 @@ use anki::notes::NoteId;
 use anki::search::SearchNode;
 use anki::version;
 use anki_proto::import_export::ImportAnkiPackageOptions;
+use fsrs::FSRS;
+use serde::Deserialize;
 
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
@@ -531,17 +533,168 @@ pub unsafe extern "C" fn flashify_notes_tag_at(
     }
 }
 
+/// Subset of the JSON serialised in the `cards.data` column. We only
+/// pull out the fields we need (FSRS state + last review time);
+/// `#[serde(default)]` keeps deserialisation tolerant when columns are
+/// missing or the file is from an older Anki version.
+#[derive(Debug, Default, Deserialize)]
+struct CardDataBlob {
+    #[serde(rename = "s", default)]
+    fsrs_stability: Option<f32>,
+    #[serde(rename = "d", default)]
+    fsrs_difficulty: Option<f32>,
+    #[serde(rename = "lrt", default)]
+    last_review_time_secs: Option<i64>,
+}
+
+fn parse_card_data(raw: &str) -> CardDataBlob {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Convert SM-2 (ease, interval) into FSRS memory state with default
+/// parameters. `FSRS` itself is `!Sync` (it owns ndarray-backed model
+/// state), so we hold it behind a Mutex and lazy-construct on first
+/// use; the Swift bridge actor already serialises calls per package
+/// so contention is essentially zero.
+fn sm2_to_fsrs(ease_factor: f32, interval_days: f32) -> Option<(f32, f32)> {
+    static INSTANCE: Mutex<Option<FSRS>> = Mutex::new(None);
+    let mut slot = INSTANCE.lock().ok()?;
+    if slot.is_none() {
+        *slot = FSRS::new(None).ok();
+    }
+    let fsrs = slot.as_ref()?;
+    let state = fsrs
+        .memory_state_from_sm2(ease_factor, interval_days, /* sm2_retention */ 0.9)
+        .ok()?;
+    Some((state.stability, state.difficulty))
+}
+
 /// Map an Anki card's scheduler state onto FSRS.
-/// TODO(PR 3b.4): read card via `col.storage.get_card(cid)`, then map
-/// SM-2 (factor/ivl/due/reps/lapses) onto FsrsState. rslib has helpers
-/// in `card::fsrs` for collections that already migrated; for legacy
-/// SM-2 cards we approximate.
+///
+/// Three paths, in priority order:
+/// 1. Card has FSRS-native state in cards.data (`s`/`d` columns set):
+///    use those directly.
+/// 2. Card has SM-2 state (interval > 0, ctype != New): convert via
+///    `fsrs::FSRS::memory_state_from_sm2` with default parameters and
+///    historical_retention = 0.9 (Anki's default before per-deck override).
+/// 3. Card is new / no scheduling history: return `FsrsState::empty()`
+///    (stability = -1 sentinel) so the caller treats it as a fresh card.
+///
+/// `due_days_from_today` is computed from the cards.queue + cards.due
+/// row interpretation: Review/DayLearn store days-since-creation,
+/// Learn stores a unix timestamp. `elapsed_days` is derived from
+/// `last_review_time` if known; 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_card_state_as_fsrs(
-    _pkg: *mut OpenedPackage,
-    _card_id: u64,
+    pkg: *mut OpenedPackage,
+    card_id: u64,
 ) -> FsrsState {
-    FsrsState::empty()
+    if pkg.is_null() {
+        set_last_error("flashify_card_state_as_fsrs: null pkg");
+        return FsrsState::empty();
+    }
+    let pkg_ref = &*pkg;
+    let mut col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_card_state_as_fsrs: collection mutex poisoned");
+            return FsrsState::empty();
+        }
+    };
+
+    // We use direct SQL because Card's scheduling fields are
+    // pub(crate) inside rslib — not reachable from our shim. The cards
+    // table schema has been stable for years and this query is read-only.
+    let row = col.storage.db().query_row::<(i64, i64, i32, i64, i64, i64, i64, String), _, _>(
+        "SELECT queue, type, due, ivl, factor, reps, lapses, COALESCE(data, '') \
+         FROM cards WHERE id = ?",
+        [card_id as i64],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,    // queue
+                row.get::<_, i64>(1)?,    // type / ctype
+                row.get::<_, i32>(2)?,    // due
+                row.get::<_, i64>(3)?,    // ivl
+                row.get::<_, i64>(4)?,    // factor
+                row.get::<_, i64>(5)?,    // reps
+                row.get::<_, i64>(6)?,    // lapses
+                row.get::<_, String>(7)?, // data
+            ))
+        },
+    );
+
+    let (queue, ctype, due, ivl, factor, reps, lapses, data_json) = match row {
+        Ok(r) => r,
+        Err(e) => {
+            set_last_error_from("flashify_card_state_as_fsrs: get card row", e);
+            return FsrsState::empty();
+        }
+    };
+
+    let blob = parse_card_data(&data_json);
+
+    // Compute days-since-collection-creation for "today".
+    let timing = match col.timing_today() {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error_from("flashify_card_state_as_fsrs: timing_today", e);
+            return FsrsState::empty();
+        }
+    };
+    let today: i32 = timing.days_elapsed as i32;
+    let now_secs: i64 = timing.now.0;
+
+    let due_days_from_today: i32 = match queue {
+        // Review (2) and DayLearn (3): due is days-since-creation
+        2 | 3 => due - today,
+        // Learn (1): due is unix timestamp; convert to days-from-today
+        1 => {
+            let delta = (due as i64) - now_secs;
+            // Round towards zero — Anki shows learning steps in minutes
+            (delta / 86_400) as i32
+        }
+        // New, suspended, buried: not really due
+        _ => 0,
+    };
+
+    // Resolve memory_state via the priority order described above.
+    let (stability, difficulty) = if let (Some(s), Some(d)) =
+        (blob.fsrs_stability, blob.fsrs_difficulty)
+    {
+        (s, d)
+    } else if ctype != 0 /* New */ && ivl > 0 {
+        let ease = (factor as f32) / 1000.0;
+        match sm2_to_fsrs(ease, ivl as f32) {
+            Some(pair) => pair,
+            None => return FsrsState::empty(),
+        }
+    } else {
+        return FsrsState {
+            stability: -1.0,
+            difficulty: -1.0,
+            due_days_from_today,
+            elapsed_days: 0,
+            reps: reps as u32,
+            lapses: lapses as u32,
+        };
+    };
+
+    let elapsed_days: i32 = match blob.last_review_time_secs {
+        Some(lrt) => {
+            let delta = now_secs - lrt;
+            ((delta.max(0)) / 86_400) as i32
+        }
+        None => 0,
+    };
+
+    FsrsState {
+        stability,
+        difficulty,
+        due_days_from_today,
+        elapsed_days,
+        reps: reps as u32,
+        lapses: lapses as u32,
+    }
 }
 
 /// Render a note template (front/back HTML) for the given note + ordinal.

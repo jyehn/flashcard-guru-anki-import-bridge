@@ -20,6 +20,16 @@ crate-type = ["staticlib"]
 anki = { path = "../anki-rs/rslib", features = ["native-tls"] }
 # Generated protobuf types used by anki's import API (ImportAnkiPackageOptions etc.)
 anki_proto = { path = "../anki-rs/rslib/proto" }
+# SM-2 → FSRS conversion (memory_state_from_sm2). Already a transitive dep
+# of anki, named here so we can call it directly without going through rslib.
+fsrs = "5.2"
+# JSON parser for the cards.data column (serialised CardData blob).
+serde_json = "1"
+# Direct SQL access to the populated Collection (Card scheduling fields are
+# pub(crate) inside rslib, so we read the cards table by hand).
+rusqlite = { version = "0.36", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 cbindgen = "0.27"
