@@ -73,6 +73,9 @@ pub struct OpenedPackage {
     pub(crate) work_dir: PathBuf,
     /// Whether `work_dir` was created by us (and should be deleted on close).
     pub(crate) owns_work_dir: bool,
+    /// `<work_dir>/collection.media`. Stored alongside as a CString so
+    /// `flashify_media_dir` can hand back a stable pointer.
+    pub(crate) media_dir_cstring: CString,
 }
 
 impl Drop for OpenedPackage {
@@ -248,6 +251,7 @@ pub unsafe extern "C" fn flashify_open_package(
             }
         };
 
+    let media_folder_for_handle = media_folder.clone();
     let mut col = match CollectionBuilder::new(&col_path)
         .set_media_paths(media_folder, media_db)
         .build()
@@ -274,11 +278,26 @@ pub unsafe extern "C" fn flashify_open_package(
         return ptr::null_mut();
     }
 
+    let media_dir_cstring = CString::new(media_folder_for_handle.to_string_lossy().as_bytes())
+        .unwrap_or_default();
     Box::into_raw(Box::new(OpenedPackage {
         collection: Mutex::new(col),
         work_dir,
         owns_work_dir: true,
+        media_dir_cstring,
     }))
+}
+
+/// Absolute path to the directory rslib extracted media files into.
+/// Pointer is owned by the package and stays valid until
+/// `flashify_free_package`. Returns NULL if `pkg` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_media_dir(pkg: *const OpenedPackage) -> *const c_char {
+    if pkg.is_null() {
+        return ptr::null();
+    }
+    let pkg = &*pkg;
+    pkg.media_dir_cstring.as_ptr()
 }
 
 #[no_mangle]
