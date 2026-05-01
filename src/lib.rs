@@ -570,6 +570,30 @@ fn sm2_to_fsrs(ease_factor: f32, interval_days: f32) -> Option<(f32, f32)> {
     Some((state.stability, state.difficulty))
 }
 
+/// Resolve the card id for a given (note_id, ord) pair so the caller
+/// can look up scheduler state. Returns 0 if no such card exists.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_card_id_for(
+    pkg: *mut OpenedPackage,
+    note_id: u64,
+    ord: u32,
+) -> u64 {
+    if pkg.is_null() {
+        return 0;
+    }
+    let pkg_ref = &*pkg;
+    let col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let id: i64 = col.storage.db().query_row(
+        "SELECT id FROM cards WHERE nid = ? AND ord = ?",
+        rusqlite::params![note_id as i64, ord as i64],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    id as u64
+}
+
 /// Map an Anki card's scheduler state onto FSRS.
 ///
 /// Three paths, in priority order:
