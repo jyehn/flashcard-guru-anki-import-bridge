@@ -611,11 +611,18 @@ fn parse_card_data(raw: &str) -> CardDataBlob {
 /// state), so we hold it behind a Mutex and lazy-construct on first
 /// use; the Swift bridge actor already serialises calls per package
 /// so contention is essentially zero.
+///
+/// Note: `FSRS::new(None)` constructs an instance with **no** parameters
+/// configured, which then panics when memory_state_from_sm2 is called
+/// (`fsrs/src/model.rs:281: "command requires parameters to be set on
+/// creation"`). Passing `Some(&[])` is the documented way to use
+/// `DEFAULT_PARAMETERS` — confirmed in fsrs's own `memory_from_sm2`
+/// test in `inference.rs`.
 fn sm2_to_fsrs(ease_factor: f32, interval_days: f32) -> Option<(f32, f32)> {
     static INSTANCE: Mutex<Option<FSRS>> = Mutex::new(None);
     let mut slot = INSTANCE.lock().ok()?;
     if slot.is_none() {
-        *slot = FSRS::new(None).ok();
+        *slot = FSRS::new(Some(&[])).ok();
     }
     let fsrs = slot.as_ref()?;
     let state = fsrs
