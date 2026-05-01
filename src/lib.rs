@@ -110,6 +110,16 @@ pub struct NoteList {
     pub(crate) rows: Vec<NoteRow>,
 }
 
+/// `(card_id, ord)` pairs for a single note. Anki notetypes can produce
+/// multiple cards per note: Basic+Reverse has 2 templates, Cloze has one
+/// template but generates one card per `{{c1}}/{{c2}}/...` deletion in
+/// the source field. Returned by `flashify_enumerate_cards_for_note` so
+/// the caller can iterate every card without going through the notetype
+/// machinery.
+pub struct CardOrdList {
+    pub(crate) rows: Vec<(u64, u32)>,
+}
+
 pub struct RenderedCard {
     pub _question_html: CString,
     pub _answer_html: CString,
@@ -568,6 +578,94 @@ fn sm2_to_fsrs(ease_factor: f32, interval_days: f32) -> Option<(f32, f32)> {
         .memory_state_from_sm2(ease_factor, interval_days, /* sm2_retention */ 0.9)
         .ok()?;
     Some((state.stability, state.difficulty))
+}
+
+/// Enumerate every card belonging to `note_id`, sorted by ord ascending.
+/// One card per template ordinal — covers Basic+Reverse (ord 0+1), Cloze
+/// (one card per cloze deletion), and any other multi-template notetype.
+/// Returns NULL on failure.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_enumerate_cards_for_note(
+    pkg: *mut OpenedPackage,
+    note_id: u64,
+) -> *mut CardOrdList {
+    if pkg.is_null() {
+        set_last_error("flashify_enumerate_cards_for_note: null pkg");
+        return ptr::null_mut();
+    }
+    let pkg_ref = &*pkg;
+    let col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_enumerate_cards_for_note: collection mutex poisoned");
+            return ptr::null_mut();
+        }
+    };
+    let mut stmt = match col
+        .storage
+        .db()
+        .prepare_cached("SELECT id, ord FROM cards WHERE nid = ? ORDER BY ord")
+    {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error_from("flashify_enumerate_cards_for_note: prepare", e);
+            return ptr::null_mut();
+        }
+    };
+    let mapped = match stmt.query_map(rusqlite::params![note_id as i64], |row| {
+        let cid: i64 = row.get(0)?;
+        let ord: i64 = row.get(1)?;
+        Ok((cid as u64, ord as u32))
+    }) {
+        Ok(iter) => iter,
+        Err(e) => {
+            set_last_error_from("flashify_enumerate_cards_for_note: query", e);
+            return ptr::null_mut();
+        }
+    };
+    let rows: Result<Vec<(u64, u32)>, rusqlite::Error> = mapped.collect();
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            set_last_error_from("flashify_enumerate_cards_for_note: collect", e);
+            return ptr::null_mut();
+        }
+    };
+    Box::into_raw(Box::new(CardOrdList { rows }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_free_card_ords(list: *mut CardOrdList) {
+    if !list.is_null() {
+        drop(Box::from_raw(list));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_card_ords_count(list: *const CardOrdList) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    let list = &*list;
+    list.rows.len() as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_card_ords_id_at(list: *const CardOrdList, idx: u64) -> u64 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(0, |(id, _)| *id)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_card_ords_ord_at(list: *const CardOrdList, idx: u64) -> u32 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.rows.get(idx as usize).map_or(0, |(_, ord)| *ord)
 }
 
 /// Resolve the card id for a given (note_id, ord) pair so the caller
