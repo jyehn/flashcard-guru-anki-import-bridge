@@ -106,9 +106,9 @@ Subsequent builds with no source changes finish in <2s.
 
 The xcframework needs to be linked into the FlashReader Xcode target
 once. The reference is already present in `FlashReader.xcodeproj/
-project.pbxproj`, so a fresh clone shouldn't need this step — just run
-the build script and re-open Xcode. If the reference is missing
-(e.g. the pbxproj was reverted):
+project.pbxproj`, so a fresh clone shouldn't need the linkage step —
+just run the build script and re-open Xcode. If the reference is
+missing (e.g. the pbxproj was reverted):
 
 1. Run `scripts/build-rust.sh release` so the xcframework exists on disk.
 2. In Xcode, drag `Vendor/RustImportCore.xcframework` into the project
@@ -122,6 +122,55 @@ the build script and re-open Xcode. If the reference is missing
 4. ⌘B to build. The Swift bridge file at
    `FlashReader/Core/Services/Import/RustImportBridge.swift` will
    resolve `import RustImportCore`.
+
+### Auto-rebuild on every Xcode build (recommended)
+
+To avoid having to remember `scripts/build-rust.sh` after editing Rust
+sources, add a Run Script build phase that does it for you. Once-off
+setup:
+
+1. Project → **FlashReader target** → **Build Phases** → **+** →
+   **New Run Script Phase**
+2. Drag the new phase to the **top** of the list (must run before
+   *Compile Sources* / *Link Binary*).
+3. Name it `Build RustImportCore` (double-click the phase title).
+4. Script body:
+   ```sh
+   if [ "$ACTION" = "indexbuild" ]; then exit 0; fi
+   "${SRCROOT}/scripts/build-rust.sh" "${CONFIGURATION:-Debug}"
+   ```
+   The first line skips the script during Xcode's background
+   indexing builds, which would otherwise spawn cargo for every
+   index update.
+5. Expand **Input Files** and add (one per line):
+   ```
+   $(SRCROOT)/Vendor/RustImportCore/Cargo.toml
+   $(SRCROOT)/Vendor/RustImportCore/Cargo.lock
+   $(SRCROOT)/Vendor/RustImportCore/build.rs
+   $(SRCROOT)/Vendor/RustImportCore/cbindgen.toml
+   $(SRCROOT)/Vendor/RustImportCore/src/lib.rs
+   ```
+6. Expand **Output Files** and add:
+   ```
+   $(SRCROOT)/Vendor/RustImportCore.xcframework/Info.plist
+   ```
+7. ⌥-click the disclosure triangle on the phase to enable
+   **"Based on dependency analysis"** (it should be on by default).
+
+Behaviour after this is wired:
+
+- **No Rust changes** → Xcode skips the phase entirely (Input Files
+  unchanged vs. Output Files). Zero overhead.
+- **Touched but unchanged Rust source** → script's internal
+  fast-skip exits in ~12 ms (compares Info.plist mtime against
+  newest source mtime).
+- **Real Rust change** → cargo recompiles. Debug profile rebuild
+  is ~10–30 s warm; release is slower because of LTO (~2–3 min)
+  and only matters for archives.
+
+If you don't want this, just remove the phase — manual
+`scripts/build-rust.sh` from the terminal still works exactly as
+before.
 
 ## FFI surface
 
