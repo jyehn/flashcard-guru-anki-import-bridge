@@ -14,6 +14,10 @@ name = "rust_import_core"
 crate-type = ["staticlib"]
 
 [dependencies]
+# rslib is large and uses native-tls for its sync layer. We don't use sync, but
+# the feature is required for the crate to type-check (without it, async-compression
+# trait bounds in src/sync/request/header_and_stream.rs fail to resolve).
+anki = { path = "../anki-rs/rslib", features = ["native-tls"] }
 
 [build-dependencies]
 cbindgen = "0.27"

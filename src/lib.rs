@@ -15,6 +15,11 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+// PR 3a smoke ref: a real call into rslib that LTO can't eliminate, so the
+// linker actually drags rslib's object code into the staticlib. PR 3b will
+// add real flashify_open_package etc. on top of import_export::*.
+use anki::version;
+
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
@@ -97,6 +102,22 @@ const ABI_VERSION: u32 = 1;
 #[no_mangle]
 pub extern "C" fn flashify_abi_version() -> u32 {
     ABI_VERSION
+}
+
+/// Smoke-test helper: returns rslib's own version string. The Swift bridge
+/// can call this in PR 3a to confirm the static library actually contains
+/// rslib code (rather than just the FFI shell).
+#[no_mangle]
+pub extern "C" fn flashify_anki_version() -> *const c_char {
+    static ANKI_VERSION: Mutex<Option<CString>> = Mutex::new(None);
+    let mut slot = match ANKI_VERSION.lock() {
+        Ok(slot) => slot,
+        Err(_) => return ptr::null(),
+    };
+    if slot.is_none() {
+        *slot = CString::new(version::version()).ok();
+    }
+    slot.as_ref().map_or(ptr::null(), |s| s.as_ptr())
 }
 
 // ---------------------------------------------------------------------------
