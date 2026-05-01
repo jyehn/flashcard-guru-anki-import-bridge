@@ -4314,6 +4314,7 @@ name = "rust_import_core"
 version = "0.1.0"
 dependencies = [
  "anki",
+ "anki_proto",
  "cbindgen",
 ]
 

@@ -18,6 +18,8 @@ crate-type = ["staticlib"]
 # the feature is required for the crate to type-check (without it, async-compression
 # trait bounds in src/sync/request/header_and_stream.rs fail to resolve).
 anki = { path = "../anki-rs/rslib", features = ["native-tls"] }
+# Generated protobuf types used by anki's import API (ImportAnkiPackageOptions etc.)
+anki_proto = { path = "../anki-rs/rslib/proto" }
 
 [build-dependencies]
 cbindgen = "0.27"

@@ -1,8 +1,9 @@
 //! RustImportCore — Anki package parsing FFI shim.
 //!
-//! PR 2b: stub implementations. The functions, types, and ownership rules
-//! defined here are the contract; PR 3 fills in the actual rslib-backed
-//! logic behind the same C ABI so the Swift side never has to change.
+//! PR 3b: real `flashify_open_package` backed by rslib. The remaining four
+//! enumeration / rendering FFIs are still stubs but now sit on top of a
+//! living `anki::collection::Collection`, so each can be filled in
+//! independently in follow-up commits without re-touching the FFI surface.
 //!
 //! Memory ownership rules (frozen now so they don't drift later):
 //! - All pointers returned by `flashify_*` allocator functions are heap-
@@ -15,26 +16,32 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-// PR 3a smoke ref: a real call into rslib that LTO can't eliminate, so the
-// linker actually drags rslib's object code into the staticlib. PR 3b will
-// add real flashify_open_package etc. on top of import_export::*.
+use anki::collection::Collection;
+use anki::collection::CollectionBuilder;
 use anki::version;
+use anki_proto::import_export::ImportAnkiPackageOptions;
 
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
-// Error storage (thread-local would be nicer; keeping it simple for the stub).
+// Error storage. Uses a global mutex; the bridge actor on the Swift side
+// already serialises calls per-package, so contention is essentially zero.
 // ---------------------------------------------------------------------------
 
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
-fn set_last_error(msg: &str) {
+fn set_last_error(msg: impl AsRef<str>) {
     if let Ok(mut slot) = LAST_ERROR.lock() {
-        *slot = CString::new(msg).ok();
+        *slot = CString::new(msg.as_ref()).ok();
     }
+}
+
+fn set_last_error_from<E: std::fmt::Display>(label: &str, err: E) {
+    set_last_error(format!("{label}: {err}"));
 }
 
 #[no_mangle]
@@ -46,13 +53,31 @@ pub unsafe extern "C" fn flashify_last_error_message() -> *const c_char {
 }
 
 // ---------------------------------------------------------------------------
-// Opaque handles. PR 3 replaces the stub fields with real rslib state.
+// Opaque handles.
 // ---------------------------------------------------------------------------
 
+/// An opened Anki package backed by a temporary `Collection` populated
+/// via `Collection::import_apkg`. The `Mutex` guards `&mut Collection`
+/// access; rslib's APIs require `&mut self` even for many reads.
 pub struct OpenedPackage {
-    /// Stub: path the caller opened. Replaced by an `anki::collection::Collection`
-    /// or equivalent in PR 3.
-    pub _path: CString,
+    /// Collection populated from the imported apkg. Read by the
+    /// enumeration FFIs once they're implemented; the `allow(dead_code)`
+    /// suppresses the warning during the partial PR 3b series.
+    #[allow(dead_code)]
+    pub(crate) collection: Mutex<Collection>,
+    /// Working directory created under workspace_path; deleted by
+    /// `flashify_free_package` if `owns_workspace` is set.
+    pub(crate) work_dir: PathBuf,
+    /// Whether `work_dir` was created by us (and should be deleted on close).
+    pub(crate) owns_work_dir: bool,
+}
+
+impl Drop for OpenedPackage {
+    fn drop(&mut self) {
+        if self.owns_work_dir {
+            let _ = std::fs::remove_dir_all(&self.work_dir);
+        }
+    }
 }
 
 pub struct DeckList {
@@ -105,8 +130,8 @@ pub extern "C" fn flashify_abi_version() -> u32 {
 }
 
 /// Smoke-test helper: returns rslib's own version string. The Swift bridge
-/// can call this in PR 3a to confirm the static library actually contains
-/// rslib code (rather than just the FFI shell).
+/// can call this to confirm the static library actually contains rslib code
+/// (rather than just the FFI shell).
 #[no_mangle]
 pub extern "C" fn flashify_anki_version() -> *const c_char {
     static ANKI_VERSION: Mutex<Option<CString>> = Mutex::new(None);
@@ -121,12 +146,45 @@ pub extern "C" fn flashify_anki_version() -> *const c_char {
 }
 
 // ---------------------------------------------------------------------------
-// Core API — 5 functions called out in the plan.
+// Internal helpers.
+// ---------------------------------------------------------------------------
+
+unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    CStr::from_ptr(ptr).to_str().ok()
+}
+
+/// Set up a fresh writable working directory under `workspace_path` for
+/// the import. Returns `(work_dir, collection_path, media_folder, media_db)`.
+fn prepare_workspace(workspace_root: &Path) -> std::io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    // Subdir keyed by PID + timestamp so concurrent imports don't collide.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let work_dir = workspace_root.join(format!("rust-import-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&work_dir)?;
+
+    let media_folder = work_dir.join("collection.media");
+    std::fs::create_dir_all(&media_folder)?;
+
+    let collection_path = work_dir.join("collection.anki2");
+    let media_db = work_dir.join("collection.media.db");
+    Ok((work_dir, collection_path, media_folder, media_db))
+}
+
+// ---------------------------------------------------------------------------
+// Core API.
 // ---------------------------------------------------------------------------
 
 /// Open an Anki package (.apkg or .colpkg) and prepare it for enumeration.
-/// `workspace_path` is a writable directory the bridge can use for temp files
-/// (e.g. zstd-decompressed sqlite).
+///
+/// `workspace_path` is a writable directory under which we create a
+/// per-import subdirectory containing a fresh SQLite collection that
+/// rslib populates from the package. The subdirectory is deleted when
+/// `flashify_free_package` is called.
 ///
 /// Returns NULL on failure; check `flashify_last_error_message`.
 #[no_mangle]
@@ -134,31 +192,79 @@ pub unsafe extern "C" fn flashify_open_package(
     package_path: *const c_char,
     workspace_path: *const c_char,
 ) -> *mut OpenedPackage {
-    if package_path.is_null() || workspace_path.is_null() {
-        set_last_error("flashify_open_package: null path");
-        return ptr::null_mut();
-    }
-    let path = match CStr::from_ptr(package_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_last_error("flashify_open_package: package_path not utf-8");
+    let package_str = match cstr_to_str(package_path) {
+        Some(s) => s,
+        None => {
+            set_last_error("flashify_open_package: invalid package_path");
             return ptr::null_mut();
         }
     };
-    set_last_error("rust_import_core stub: open_package not implemented yet");
+    let workspace_str = match cstr_to_str(workspace_path) {
+        Some(s) => s,
+        None => {
+            set_last_error("flashify_open_package: invalid workspace_path");
+            return ptr::null_mut();
+        }
+    };
+
+    let (work_dir, col_path, media_folder, media_db) =
+        match prepare_workspace(Path::new(workspace_str)) {
+            Ok(paths) => paths,
+            Err(e) => {
+                set_last_error_from("flashify_open_package: prepare workspace", e);
+                return ptr::null_mut();
+            }
+        };
+
+    let mut col = match CollectionBuilder::new(&col_path)
+        .set_media_paths(media_folder, media_db)
+        .build()
+    {
+        Ok(col) => col,
+        Err(e) => {
+            set_last_error_from("flashify_open_package: build collection", e);
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return ptr::null_mut();
+        }
+    };
+
+    // Default options preserve scheduling and merge notetypes by id.
+    let options = ImportAnkiPackageOptions {
+        with_scheduling: true,
+        with_deck_configs: true,
+        merge_notetypes: true,
+        ..Default::default()
+    };
+
+    if let Err(e) = col.import_apkg(package_str, options) {
+        set_last_error_from("flashify_open_package: import_apkg", e);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return ptr::null_mut();
+    }
+
     Box::into_raw(Box::new(OpenedPackage {
-        _path: CString::new(path).unwrap_or_default(),
+        collection: Mutex::new(col),
+        work_dir,
+        owns_work_dir: true,
     }))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn flashify_free_package(pkg: *mut OpenedPackage) {
     if !pkg.is_null() {
+        // Drop runs cleanup of work_dir.
         drop(Box::from_raw(pkg));
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stub enumerators / renderer. Each will be implemented in a follow-up
+// commit using the now-living `Collection` inside OpenedPackage.
+// ---------------------------------------------------------------------------
+
 /// Enumerate decks inside the opened package.
+/// TODO(PR 3b.2): walk `pkg.collection.lock().get_all_normal_deck_names(false)`
+/// or storage.get_all_decks(); return id+name pairs.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_enumerate_decks(_pkg: *mut OpenedPackage) -> *mut DeckList {
     Box::into_raw(Box::new(DeckList { _names: Vec::new() }))
@@ -172,6 +278,8 @@ pub unsafe extern "C" fn flashify_free_decks(decks: *mut DeckList) {
 }
 
 /// Enumerate notes for a specific deck (or all notes if `deck_id` is 0).
+/// TODO(PR 3b.3): use `col.search_notes_unordered` or
+/// `col.storage.all_notes_in_decks([deck_id])`.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_enumerate_notes(
     _pkg: *mut OpenedPackage,
@@ -187,8 +295,11 @@ pub unsafe extern "C" fn flashify_free_notes(notes: *mut NoteList) {
     }
 }
 
-/// Map an Anki card's scheduler state onto FSRS. PR 3 wires this to the
-/// real conversion baked into rslib.
+/// Map an Anki card's scheduler state onto FSRS.
+/// TODO(PR 3b.4): read card via `col.storage.get_card(cid)`, then map
+/// SM-2 (factor/ivl/due/reps/lapses) onto FsrsState. rslib has helpers
+/// in `card::fsrs` for collections that already migrated; for legacy
+/// SM-2 cards we approximate.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_card_state_as_fsrs(
     _pkg: *mut OpenedPackage,
@@ -198,6 +309,8 @@ pub unsafe extern "C" fn flashify_card_state_as_fsrs(
 }
 
 /// Render a note template (front/back HTML) for the given note + ordinal.
+/// TODO(PR 3b.5): use `col.render_existing_card(card_id, browser=false)`
+/// or `col.render_uncommitted_card_legacy()`. Returns rendered Q/A HTML.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_render_template(
     _pkg: *mut OpenedPackage,
