@@ -16,6 +16,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+use anki::card::CardId;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::decks::DeckId;
@@ -697,18 +698,72 @@ pub unsafe extern "C" fn flashify_card_state_as_fsrs(
     }
 }
 
-/// Render a note template (front/back HTML) for the given note + ordinal.
-/// TODO(PR 3b.5): use `col.render_existing_card(card_id, browser=false)`
-/// or `col.render_uncommitted_card_legacy()`. Returns rendered Q/A HTML.
+/// Render a note template (question + answer HTML) for the card at
+/// `(note_id, ord)`. Returns NULL on failure; check
+/// `flashify_last_error_message`. The returned handle owns the strings
+/// and must be released with `flashify_free_rendered`.
+///
+/// Internally we look up the card id via direct SQL (the rslib
+/// equivalent `storage.get_card_by_ordinal` is `pub(crate)`), then call
+/// `render_existing_card(cid, browser=false, partial_render=false)` so
+/// `RenderCardOutput::question()` / `answer()` return fully-rendered
+/// HTML.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_render_template(
-    _pkg: *mut OpenedPackage,
-    _note_id: u64,
-    _ord: u32,
+    pkg: *mut OpenedPackage,
+    note_id: u64,
+    ord: u32,
 ) -> *mut RenderedCard {
+    if pkg.is_null() {
+        set_last_error("flashify_render_template: null pkg");
+        return ptr::null_mut();
+    }
+    let pkg_ref = &*pkg;
+    let mut col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_render_template: collection mutex poisoned");
+            return ptr::null_mut();
+        }
+    };
+
+    let card_id_raw: i64 = match col.storage.db().query_row::<i64, _, _>(
+        "SELECT id FROM cards WHERE nid = ? AND ord = ?",
+        rusqlite::params![note_id as i64, ord as i64],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            set_last_error(format!(
+                "flashify_render_template: no card for note {note_id} ord {ord}"
+            ));
+            return ptr::null_mut();
+        }
+        Err(e) => {
+            set_last_error_from("flashify_render_template: lookup card id", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let output = match col.render_existing_card(
+        CardId(card_id_raw),
+        /* browser */ false,
+        /* partial_render */ false,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            set_last_error_from("flashify_render_template: render_existing_card", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let question = output.question().into_owned();
+    let answer = output.answer().into_owned();
+    let question_html = CString::new(question.replace('\0', "")).unwrap_or_default();
+    let answer_html = CString::new(answer.replace('\0', "")).unwrap_or_default();
     Box::into_raw(Box::new(RenderedCard {
-        _question_html: CString::new("").unwrap(),
-        _answer_html: CString::new("").unwrap(),
+        _question_html: question_html,
+        _answer_html: answer_html,
     }))
 }
 
@@ -717,6 +772,26 @@ pub unsafe extern "C" fn flashify_free_rendered(card: *mut RenderedCard) {
     if !card.is_null() {
         drop(Box::from_raw(card));
     }
+}
+
+/// Question HTML pointer. Valid until `flashify_free_rendered`. NULL if `card` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_question(card: *const RenderedCard) -> *const c_char {
+    if card.is_null() {
+        return ptr::null();
+    }
+    let card = &*card;
+    card._question_html.as_ptr()
+}
+
+/// Answer HTML pointer. Valid until `flashify_free_rendered`. NULL if `card` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_answer(card: *const RenderedCard) -> *const c_char {
+    if card.is_null() {
+        return ptr::null();
+    }
+    let card = &*card;
+    card._answer_html.as_ptr()
 }
 
 /// Status code for void operations. Zero = OK, non-zero = error (check
