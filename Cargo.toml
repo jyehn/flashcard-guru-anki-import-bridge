@@ -1,0 +1,25 @@
+[package]
+name = "rust_import_core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# PR 2b: stub FFI shim. PR 3 will add ankitects/anki as a path dependency
+# (via git submodule under Vendor/anki-rs) and replace the stub returns with
+# real rslib calls. Keeping the dependency surface empty here lets the build
+# pipeline (cargo + cbindgen + xcframework) be validated in isolation.
+
+[lib]
+name = "rust_import_core"
+crate-type = ["staticlib"]
+
+[dependencies]
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
