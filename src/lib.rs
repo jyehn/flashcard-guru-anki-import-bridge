@@ -314,8 +314,15 @@ pub unsafe extern "C" fn flashify_free_package(pkg: *mut OpenedPackage) {
 // ---------------------------------------------------------------------------
 
 /// Enumerate decks inside the opened package. Returns NULL on failure;
-/// check `flashify_last_error_message`. The default deck (id=1) is omitted
-/// since import_apkg leaves it empty.
+/// check `flashify_last_error_message`.
+///
+/// Filtering: we keep every deck that has at least one card, and drop
+/// the rest. We can't simply pass `skip_default: true` to rslib because
+/// .apkg packages frequently store their content under deck id 1 (the
+/// default) — particularly anything exported from Anki's "Export ->
+/// All Decks" or from a single-deck collection. The "deck has cards"
+/// check is the right invariant: empty decks aren't useful to surface
+/// to the persister, regardless of id.
 #[no_mangle]
 pub unsafe extern "C" fn flashify_enumerate_decks(pkg: *mut OpenedPackage) -> *mut DeckList {
     if pkg.is_null() {
@@ -330,7 +337,7 @@ pub unsafe extern "C" fn flashify_enumerate_decks(pkg: *mut OpenedPackage) -> *m
             return ptr::null_mut();
         }
     };
-    let pairs = match col.get_all_deck_names(/* skip_default */ true) {
+    let pairs = match col.get_all_deck_names(/* skip_default */ false) {
         Ok(p) => p,
         Err(e) => {
             set_last_error_from("flashify_enumerate_decks", e);
@@ -338,9 +345,27 @@ pub unsafe extern "C" fn flashify_enumerate_decks(pkg: *mut OpenedPackage) -> *m
         }
     };
 
+    let mut stmt = match col
+        .storage
+        .db()
+        .prepare_cached("SELECT 1 FROM cards WHERE did = ? LIMIT 1")
+    {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error_from("flashify_enumerate_decks: prepare", e);
+            return ptr::null_mut();
+        }
+    };
+
     let mut ids: Vec<u64> = Vec::with_capacity(pairs.len());
     let mut names: Vec<CString> = Vec::with_capacity(pairs.len());
     for (DeckId(raw_id), name) in pairs {
+        let has_cards = stmt
+            .query_row(rusqlite::params![raw_id], |_| Ok(()))
+            .is_ok();
+        if !has_cards {
+            continue;
+        }
         ids.push(raw_id as u64);
         // CString::new fails if the name contains an interior NUL. Decks
         // can't really have those but be defensive — replace rather than
