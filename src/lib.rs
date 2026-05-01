@@ -18,6 +18,7 @@
 
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
+use anki::decks::DeckId;
 use anki::version;
 use anki_proto::import_export::ImportAnkiPackageOptions;
 
@@ -60,10 +61,7 @@ pub unsafe extern "C" fn flashify_last_error_message() -> *const c_char {
 /// via `Collection::import_apkg`. The `Mutex` guards `&mut Collection`
 /// access; rslib's APIs require `&mut self` even for many reads.
 pub struct OpenedPackage {
-    /// Collection populated from the imported apkg. Read by the
-    /// enumeration FFIs once they're implemented; the `allow(dead_code)`
-    /// suppresses the warning during the partial PR 3b series.
-    #[allow(dead_code)]
+    /// Collection populated from the imported apkg.
     pub(crate) collection: Mutex<Collection>,
     /// Working directory created under workspace_path; deleted by
     /// `flashify_free_package` if `owns_workspace` is set.
@@ -80,8 +78,14 @@ impl Drop for OpenedPackage {
     }
 }
 
+/// Snapshot of the decks inside an `OpenedPackage`. Built up-front by
+/// `flashify_enumerate_decks` so the indexed accessors (`flashify_decks_*_at`)
+/// can serve every read without re-locking the Collection. Names are the
+/// fully-qualified hierarchical strings rslib returns (e.g. `Parent::Child`);
+/// Swift can split on `::` if it wants a tree.
 pub struct DeckList {
-    pub _names: Vec<CString>,
+    pub(crate) ids: Vec<u64>,
+    pub(crate) names: Vec<CString>,
 }
 
 pub struct NoteList {
@@ -262,12 +266,42 @@ pub unsafe extern "C" fn flashify_free_package(pkg: *mut OpenedPackage) {
 // commit using the now-living `Collection` inside OpenedPackage.
 // ---------------------------------------------------------------------------
 
-/// Enumerate decks inside the opened package.
-/// TODO(PR 3b.2): walk `pkg.collection.lock().get_all_normal_deck_names(false)`
-/// or storage.get_all_decks(); return id+name pairs.
+/// Enumerate decks inside the opened package. Returns NULL on failure;
+/// check `flashify_last_error_message`. The default deck (id=1) is omitted
+/// since import_apkg leaves it empty.
 #[no_mangle]
-pub unsafe extern "C" fn flashify_enumerate_decks(_pkg: *mut OpenedPackage) -> *mut DeckList {
-    Box::into_raw(Box::new(DeckList { _names: Vec::new() }))
+pub unsafe extern "C" fn flashify_enumerate_decks(pkg: *mut OpenedPackage) -> *mut DeckList {
+    if pkg.is_null() {
+        set_last_error("flashify_enumerate_decks: null pkg");
+        return ptr::null_mut();
+    }
+    let pkg_ref = &*pkg;
+    let col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_enumerate_decks: collection mutex poisoned");
+            return ptr::null_mut();
+        }
+    };
+    let pairs = match col.get_all_deck_names(/* skip_default */ true) {
+        Ok(p) => p,
+        Err(e) => {
+            set_last_error_from("flashify_enumerate_decks", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let mut ids: Vec<u64> = Vec::with_capacity(pairs.len());
+    let mut names: Vec<CString> = Vec::with_capacity(pairs.len());
+    for (DeckId(raw_id), name) in pairs {
+        ids.push(raw_id as u64);
+        // CString::new fails if the name contains an interior NUL. Decks
+        // can't really have those but be defensive — replace rather than
+        // skip the row, since indices are tied to ids.
+        let cstring = CString::new(name.replace('\0', "")).unwrap_or_default();
+        names.push(cstring);
+    }
+    Box::into_raw(Box::new(DeckList { ids, names }))
 }
 
 #[no_mangle]
@@ -275,6 +309,36 @@ pub unsafe extern "C" fn flashify_free_decks(decks: *mut DeckList) {
     if !decks.is_null() {
         drop(Box::from_raw(decks));
     }
+}
+
+/// Number of decks in the list, or -1 if `list` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_decks_count(list: *const DeckList) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    (*list).ids.len() as i64
+}
+
+/// Deck id at the given index, or 0 if out of range / null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_decks_id_at(list: *const DeckList, idx: u64) -> u64 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.ids.get(idx as usize).copied().unwrap_or(0)
+}
+
+/// Deck name at the given index. Pointer is valid until `flashify_free_decks`
+/// is called on the parent list. Returns NULL if out of range / null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_decks_name_at(list: *const DeckList, idx: u64) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    list.names.get(idx as usize).map_or(ptr::null(), |s| s.as_ptr())
 }
 
 /// Enumerate notes for a specific deck (or all notes if `deck_id` is 0).
