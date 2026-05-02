@@ -126,6 +126,11 @@ pub struct CardOrdList {
 pub struct RenderedCard {
     pub _question_html: CString,
     pub _answer_html: CString,
+    /// Notetype CSS as authored in Anki's card-template editor. Required
+    /// for visually-correct rendering — without it cards lose all
+    /// notetype branding (Anking's logo styling, AnKing-clone hidden
+    /// state markers, the dot-leader spacing on cloze cards, etc.).
+    pub _css: CString,
 }
 
 #[repr(C)]
@@ -934,10 +939,23 @@ pub unsafe extern "C" fn flashify_render_template(
     let answer = output.answer().into_owned();
     let question_html = CString::new(question.replace('\0', "")).unwrap_or_default();
     let answer_html = CString::new(answer.replace('\0', "")).unwrap_or_default();
+    let css = CString::new(output.css.replace('\0', "")).unwrap_or_default();
     Box::into_raw(Box::new(RenderedCard {
         _question_html: question_html,
         _answer_html: answer_html,
+        _css: css,
     }))
+}
+
+/// Notetype CSS for the rendered card. Pointer is borrowed from the
+/// parent handle and is valid until `flashify_free_rendered`.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_css(card: *const RenderedCard) -> *const c_char {
+    if card.is_null() {
+        return ptr::null();
+    }
+    let card = &*card;
+    card._css.as_ptr()
 }
 
 #[no_mangle]
