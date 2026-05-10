@@ -1,17 +1,36 @@
-# RustImportCore
+# flashcard-guru-anki-import-bridge
 
 A static-library FFI shim that exposes a narrow C ABI on top of
 [ankitects/anki](https://github.com/ankitects/anki)'s `rslib` crate, so the
-FlashReader iOS app can parse `.apkg` / `.colpkg` packages, render note
-templates, and convert SM-2 scheduling state into FSRS — all using the
-canonical Anki implementation rather than a hand-rolled parser.
+[Flashcard Guru iOS app](https://flashcard-guru.flashify.app) can parse
+`.apkg` / `.colpkg` packages, render note templates, and convert SM-2
+scheduling state into FSRS — all using the canonical Anki implementation
+rather than a hand-rolled parser.
 
-> **License:** AGPL-3.0-or-later (because rslib is AGPL). The FlashReader
-> repository inherits the AGPL obligation. If you're forking this for a
-> closed-source app, replace this directory with a pure-Swift parser
-> (the architecture above the bridge is parser-agnostic) — see
-> `IMPORT_PLAN.md` if it exists, or read the doc comment at the top of
-> `Core/Services/Import/RustImportBridge.swift`.
+> **License:** AGPL-3.0-or-later (because rslib is AGPL).
+> See [`LICENSE`](LICENSE) for the full text.
+>
+> The Flashcard Guru iOS app links the compiled xcframework as a binary
+> dependency. The AGPL obligations apply to the compiled artifact and
+> this source; the rest of the iOS app (which only sees a narrow Swift
+> interface above this crate) is not affected.
+>
+> If you're forking this for a closed-source app and want to avoid AGPL,
+> replace this whole crate with a pure-Swift `.apkg` parser — the Swift
+> architecture above the bridge is parser-agnostic.
+
+## Repository layout
+
+This crate was extracted from the
+[`flashifyIOS`](https://flashcard-guru.flashify.app) repository on
+2026-05-09 to satisfy AGPL-3.0's source-availability obligation cleanly.
+It is consumed back into `flashifyIOS` as a git submodule at
+`Vendor/RustImportCore/`. The Flashcard Guru iOS app's
+[`Core/Services/Import/`](https://github.com/jyehn/flashcard-guru-anki-import-bridge)
+bridge calls into the resulting `xcframework`.
+
+For standalone development (without flashifyIOS), see
+[Standalone build](#standalone-build) below.
 
 ## What it is
 
@@ -428,3 +447,28 @@ submodule contents are also worth caching.
   — the state machine that ties everything together.
 - [`scripts/build-rust.sh`](../../scripts/build-rust.sh) — the build
   pipeline.
+
+## Standalone build
+
+This crate currently depends on Anki's `rslib` via a relative path:
+
+```toml
+anki = { path = "../anki-rs/rslib", features = ["native-tls"] }
+```
+
+So a standalone clone needs Anki at `../anki-rs/`:
+
+```bash
+git clone https://github.com/jyehn/flashcard-guru-anki-import-bridge
+git clone https://github.com/ankitects/anki ../anki-rs
+cd ../anki-rs && git checkout 7d8dc01722b4b6dfbea83df6cc38f0fbaf0fdbf1
+cd ../flashcard-guru-anki-import-bridge && cargo check
+```
+
+Inside `flashifyIOS` this layout is provided automatically by
+`Vendor/anki-rs/` (an existing git submodule of the same upstream commit
+that is sibling to `Vendor/RustImportCore/`).
+
+Future work will switch this dependency to a Cargo `git` dep or vendor
+anki-rs as a submodule of *this* repo, so the crate is buildable with
+no external setup. Tracked in flashifyIOS's release plan.
