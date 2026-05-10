@@ -13,6 +13,11 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
 
+    # The default GITHUB_TOKEN is read-only for `contents`; the
+    # softprops/action-gh-release step needs write to create the Release.
+    permissions:
+      contents: write
+
     # Pin this in lockstep with flashifyIOS's Vendor/anki-rs submodule.
     # Bumping this is the lever for picking up a newer rslib.
     env:
