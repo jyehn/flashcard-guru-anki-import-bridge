@@ -1,0 +1,84 @@
+name: Release xcframework
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  # Manual trigger for testing the build pipeline before tagging a real release.
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and release xcframework
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    # Pin this in lockstep with flashifyIOS's Vendor/anki-rs submodule.
+    # Bumping this is the lever for picking up a newer rslib.
+    env:
+      ANKI_REV: 7d8dc01722b4b6dfbea83df6cc38f0fbaf0fdbf1
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+
+      - name: Clone anki-rs as sibling
+        run: |
+          set -euxo pipefail
+          PARENT="$(dirname "$GITHUB_WORKSPACE")"
+          cd "$PARENT"
+          git clone https://github.com/ankitects/anki anki-rs
+          cd anki-rs
+          git checkout "$ANKI_REV"
+          git submodule update --init --recursive ftl/core-repo ftl/qt-repo
+
+      - name: Install protoc
+        run: brew install protobuf
+
+      - name: Add Rust iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          protoc --version
+          xcodebuild -version
+
+      - name: Build xcframework
+        env:
+          PROTOC: /opt/homebrew/bin/protoc
+        run: ./scripts/build-xcframework.sh release
+
+      - name: Zip + checksum
+        run: |
+          set -euxo pipefail
+          test -d RustImportCore.xcframework
+          zip -qry RustImportCore.xcframework.zip RustImportCore.xcframework
+          shasum -a 256 RustImportCore.xcframework.zip > RustImportCore.xcframework.zip.sha256
+          ls -la RustImportCore.xcframework.zip*
+          cat RustImportCore.xcframework.zip.sha256
+
+      # On tag push: attach to the GitHub release and let downstream tooling
+      # (flashifyIOS' fetch script, future SPM binary target) pick it up.
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            RustImportCore.xcframework.zip
+            RustImportCore.xcframework.zip.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      # On workflow_dispatch (manual trial): expose as a workflow artifact so
+      # we can download + smoke-test before cutting a real tag.
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustImportCore-xcframework-${{ github.run_id }}
+          path: |
+            RustImportCore.xcframework.zip
+            RustImportCore.xcframework.zip.sha256
+          retention-days: 7
