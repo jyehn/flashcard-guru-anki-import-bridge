@@ -103,6 +103,12 @@ pub(crate) struct NoteRow {
     pub(crate) notetype_id: u64,
     pub(crate) fields: Vec<CString>,
     pub(crate) tags: Vec<CString>,
+    /// Anki's sort field for this note (the notetype's `sort_field_idx`-th
+    /// field, HTML-stripped) — the deck author's designated identifying text,
+    /// i.e. what Anki's own Browser shows. Lets a caller render a
+    /// structure-agnostic list-row preview instead of parsing the card's
+    /// rendered template HTML (which can lead with tag/CSS/JS chrome).
+    pub(crate) sort_field: CString,
 }
 
 /// Snapshot of notes inside a deck (or all notes if the caller passed
@@ -162,7 +168,8 @@ impl FsrsState {
 // Versioning so Swift can refuse a mismatched xcframework at runtime.
 // ---------------------------------------------------------------------------
 
-const ABI_VERSION: u32 = 1;
+// v2: added flashify_notes_sort_field_at (Anki sort field per note).
+const ABI_VERSION: u32 = 2;
 
 #[no_mangle]
 pub extern "C" fn flashify_abi_version() -> u32 {
@@ -483,11 +490,27 @@ pub unsafe extern "C" fn flashify_enumerate_notes(
             .iter()
             .map(|t| CString::new(t.replace('\0', "")).unwrap_or_default())
             .collect();
+        // Anki's sort field = the notetype's `sort_field_idx`-th field, HTML
+        // stripped. It is the Browser-facing identifier; capturing it lets the
+        // iOS list row show the author-designated text rather than parsing the
+        // rendered template (which can lead with tag/CSS/JS chrome). `note` is
+        // owned here, so the `&mut col` borrow in `get_notetype` is fine.
+        let sort_field = {
+            let idx = col
+                .get_notetype(note.notetype_id)
+                .ok()
+                .flatten()
+                .map(|nt| nt.config.sort_field_idx as usize)
+                .unwrap_or(0);
+            let raw = note.fields().get(idx).map(String::as_str).unwrap_or("");
+            CString::new(anki::text::strip_html(raw).replace('\0', "")).unwrap_or_default()
+        };
         rows.push(NoteRow {
             id: note.id.0 as u64,
             notetype_id: note.notetype_id.0 as u64,
             fields,
             tags,
+            sort_field,
         });
     }
 
@@ -591,6 +614,24 @@ pub unsafe extern "C" fn flashify_notes_tag_at(
             .map_or(ptr::null(), |s| s.as_ptr()),
         None => ptr::null(),
     }
+}
+
+/// Anki sort-field text at the given note index (HTML-stripped). Pointer is
+/// valid until `flashify_free_notes`; NULL on null/oob. This is the value
+/// Anki's own Browser shows for the note, so callers should prefer it for
+/// list-row previews over parsing the rendered template HTML.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notes_sort_field_at(
+    list: *const NoteList,
+    idx: u64,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    list.rows
+        .get(idx as usize)
+        .map_or(ptr::null(), |r| r.sort_field.as_ptr())
 }
 
 /// Subset of the JSON serialised in the `cards.data` column. We only
