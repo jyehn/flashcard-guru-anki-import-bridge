@@ -21,6 +21,7 @@ use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::decks::DeckId;
 use anki::notes::NoteId;
+use anki::notetype::NotetypeId;
 use anki::search::SearchNode;
 use anki::version;
 use anki_proto::import_export::ImportAnkiPackageOptions;
@@ -139,6 +140,27 @@ pub struct RenderedCard {
     pub _css: CString,
 }
 
+/// Snapshot of a notetype's *editing* schema: the ordered field names plus
+/// every card template's `(ord, name, qfmt, afmt)` and the shared CSS.
+/// `flashify_render_template` already returns *rendered* HTML for review; this
+/// exposes the *source* schema so the iOS importer can persist a
+/// `CardModelObject` and re-render a note after the user edits its structured
+/// fields — through the exact templates Anki authored, keyed by real field
+/// names instead of positional `field_0` placeholders.
+///
+/// Strings are owned `CString`s so the indexed accessor pointers stay valid
+/// until `flashify_free_notetype_schema`. The four per-template vectors are
+/// parallel (index `i` describes one template); kept column-oriented to mirror
+/// the existing list accessors rather than introduce a nested handle.
+pub struct NotetypeSchema {
+    pub(crate) field_names: Vec<CString>,
+    pub(crate) css: CString,
+    pub(crate) template_ords: Vec<u32>,
+    pub(crate) template_names: Vec<CString>,
+    pub(crate) template_qfmts: Vec<CString>,
+    pub(crate) template_afmts: Vec<CString>,
+}
+
 #[repr(C)]
 pub struct FsrsState {
     /// Card scheduler state mapped onto FSRS. -1 means "no scheduling info"
@@ -169,7 +191,11 @@ impl FsrsState {
 // ---------------------------------------------------------------------------
 
 // v2: added flashify_notes_sort_field_at (Anki sort field per note).
-const ABI_VERSION: u32 = 2;
+// v3: added the flashify_notetype_schema family (notetype field names +
+//     per-template qfmt/afmt + css) so the iOS importer can persist a
+//     re-renderable CardModelObject and edit a note's structured fields
+//     instead of being stuck with positional `field_0` keys.
+const ABI_VERSION: u32 = 3;
 
 #[no_mangle]
 pub extern "C" fn flashify_abi_version() -> u32 {
@@ -1024,6 +1050,207 @@ pub unsafe extern "C" fn flashify_rendered_answer(card: *const RenderedCard) -> 
     }
     let card = &*card;
     card._answer_html.as_ptr()
+}
+
+// ---------------------------------------------------------------------------
+// Notetype schema (ABI v3). Exposes a notetype's field names + card templates
+// so the iOS importer can persist a re-renderable CardModelObject and let the
+// user edit a note's structured fields. Built eagerly by
+// `flashify_notetype_schema`; the column-oriented accessors below never
+// re-lock the Collection.
+// ---------------------------------------------------------------------------
+
+/// Fetch the editing schema for a notetype (by id). Returns NULL on failure
+/// (unknown id / poisoned mutex); check `flashify_last_error_message`. The
+/// returned handle owns its strings and must be released with
+/// `flashify_free_notetype_schema`.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_schema(
+    pkg: *mut OpenedPackage,
+    notetype_id: u64,
+) -> *mut NotetypeSchema {
+    if pkg.is_null() {
+        set_last_error("flashify_notetype_schema: null pkg");
+        return ptr::null_mut();
+    }
+    let pkg_ref = &*pkg;
+    // get_notetype takes &mut self (it lazily caches), so lock mutably.
+    let mut col = match pkg_ref.collection.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("flashify_notetype_schema: collection mutex poisoned");
+            return ptr::null_mut();
+        }
+    };
+
+    let nt = match col.get_notetype(NotetypeId(notetype_id as i64)) {
+        Ok(Some(nt)) => nt,
+        Ok(None) => {
+            set_last_error(format!(
+                "flashify_notetype_schema: no notetype with id {notetype_id}"
+            ));
+            return ptr::null_mut();
+        }
+        Err(e) => {
+            set_last_error_from("flashify_notetype_schema: get_notetype", e);
+            return ptr::null_mut();
+        }
+    };
+
+    // Interior-NUL defence mirrors the note/deck accessors: replace rather than
+    // skip, so field/template indices stay aligned with the source order.
+    let to_cstring = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
+
+    let field_names: Vec<CString> = nt.fields.iter().map(|f| to_cstring(&f.name)).collect();
+    let css = to_cstring(&nt.config.css);
+
+    let mut template_ords = Vec::with_capacity(nt.templates.len());
+    let mut template_names = Vec::with_capacity(nt.templates.len());
+    let mut template_qfmts = Vec::with_capacity(nt.templates.len());
+    let mut template_afmts = Vec::with_capacity(nt.templates.len());
+    for (i, t) in nt.templates.iter().enumerate() {
+        // `ord` is Option in rslib but always set for stored templates; fall
+        // back to the positional index defensively so the vectors stay aligned.
+        template_ords.push(t.ord.unwrap_or(i as u32));
+        template_names.push(to_cstring(&t.name));
+        template_qfmts.push(to_cstring(&t.config.q_format));
+        template_afmts.push(to_cstring(&t.config.a_format));
+    }
+
+    Box::into_raw(Box::new(NotetypeSchema {
+        field_names,
+        css,
+        template_ords,
+        template_names,
+        template_qfmts,
+        template_afmts,
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_free_notetype_schema(schema: *mut NotetypeSchema) {
+    if !schema.is_null() {
+        drop(Box::from_raw(schema));
+    }
+}
+
+/// Number of fields, or -1 if `schema` is null. The order is the notetype's
+/// own field order (index 0 = first field) — the order the `{{FieldName}}`
+/// placeholders in the templates resolve against.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_field_count(schema: *const NotetypeSchema) -> i64 {
+    if schema.is_null() {
+        return -1;
+    }
+    let schema = &*schema;
+    schema.field_names.len() as i64
+}
+
+/// Field name at `idx`. Pointer valid until `flashify_free_notetype_schema`.
+/// NULL on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_field_name_at(
+    schema: *const NotetypeSchema,
+    idx: u64,
+) -> *const c_char {
+    if schema.is_null() {
+        return ptr::null();
+    }
+    let schema = &*schema;
+    schema
+        .field_names
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Notetype CSS. Pointer valid until `flashify_free_notetype_schema`; never
+/// NULL for a non-null schema (empty string when the notetype has no CSS).
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_css(schema: *const NotetypeSchema) -> *const c_char {
+    if schema.is_null() {
+        return ptr::null();
+    }
+    let schema = &*schema;
+    schema.css.as_ptr()
+}
+
+/// Number of card templates, or -1 if `schema` is null. Basic = 1,
+/// Basic+Reverse = 2, Cloze = 1 (every cloze card shares one template).
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_template_count(schema: *const NotetypeSchema) -> i64 {
+    if schema.is_null() {
+        return -1;
+    }
+    let schema = &*schema;
+    schema.template_ords.len() as i64
+}
+
+/// Template ordinal (Anki's `ord`) at `idx`, or 0 on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_template_ord_at(
+    schema: *const NotetypeSchema,
+    idx: u64,
+) -> u32 {
+    if schema.is_null() {
+        return 0;
+    }
+    let schema = &*schema;
+    schema
+        .template_ords
+        .get(idx as usize)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Template name at `idx`. Pointer valid until free. NULL on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_template_name_at(
+    schema: *const NotetypeSchema,
+    idx: u64,
+) -> *const c_char {
+    if schema.is_null() {
+        return ptr::null();
+    }
+    let schema = &*schema;
+    schema
+        .template_names
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Template question format (`qfmt` — the front-side template, with
+/// `{{FieldName}}` placeholders) at `idx`. Pointer valid until free. NULL on
+/// null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_template_qfmt_at(
+    schema: *const NotetypeSchema,
+    idx: u64,
+) -> *const c_char {
+    if schema.is_null() {
+        return ptr::null();
+    }
+    let schema = &*schema;
+    schema
+        .template_qfmts
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Template answer format (`afmt` — the back-side template) at `idx`. Pointer
+/// valid until free. NULL on null/oob.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_template_afmt_at(
+    schema: *const NotetypeSchema,
+    idx: u64,
+) -> *const c_char {
+    if schema.is_null() {
+        return ptr::null();
+    }
+    let schema = &*schema;
+    schema
+        .template_afmts
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
 }
 
 /// Status code for void operations. Zero = OK, non-zero = error (check
