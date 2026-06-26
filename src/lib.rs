@@ -21,7 +21,14 @@ use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::decks::DeckId;
 use anki::notes::NoteId;
+use anki::notetype::CardTemplate;
+use anki::notetype::NoteField;
+use anki::notetype::Notetype;
+use anki::notetype::NotetypeConfig;
 use anki::notetype::NotetypeId;
+use anki::notetype::NotetypeKind;
+use anki::prelude::TimestampSecs;
+use anki::prelude::Usn;
 use anki::search::SearchNode;
 use anki::version;
 use anki_proto::import_export::ImportAnkiPackageOptions;
@@ -155,6 +162,12 @@ pub struct RenderedCard {
 pub struct NotetypeSchema {
     pub(crate) field_names: Vec<CString>,
     pub(crate) css: CString,
+    /// Whether this is a cloze notetype — the iOS side stores it so
+    /// `flashify_render_fields` re-creates the notetype with the right kind
+    /// (cloze = one card per `{{c1::}}` deletion, single template).
+    pub(crate) is_cloze: bool,
+    /// The notetype's sort-field index (which field Anki titles the row by).
+    pub(crate) sort_field_idx: u32,
     pub(crate) template_ords: Vec<u32>,
     pub(crate) template_names: Vec<CString>,
     pub(crate) template_qfmts: Vec<CString>,
@@ -195,7 +208,12 @@ impl FsrsState {
 //     per-template qfmt/afmt + css) so the iOS importer can persist a
 //     re-renderable CardModelObject and edit a note's structured fields
 //     instead of being stuck with positional `field_0` keys.
-const ABI_VERSION: u32 = 3;
+// v4: schema also exposes is_cloze + sort_field_idx; added the
+//     flashify_render_fields family — render a note from a notetype definition
+//     + field values through the real Anki engine (a throwaway in-memory
+//     collection), so an edited card re-renders with full template support
+//     (conditionals, filters, cloze) instead of the iOS half-renderer.
+const ABI_VERSION: u32 = 4;
 
 #[no_mangle]
 pub extern "C" fn flashify_abi_version() -> u32 {
@@ -1117,9 +1135,14 @@ pub unsafe extern "C" fn flashify_notetype_schema(
         template_afmts.push(to_cstring(&t.config.a_format));
     }
 
+    let is_cloze = nt.config.kind() == NotetypeKind::Cloze;
+    let sort_field_idx = nt.config.sort_field_idx;
+
     Box::into_raw(Box::new(NotetypeSchema {
         field_names,
         css,
+        is_cloze,
+        sort_field_idx,
         template_ords,
         template_names,
         template_qfmts,
@@ -1253,9 +1276,352 @@ pub unsafe extern "C" fn flashify_notetype_template_afmt_at(
         .map_or(ptr::null(), |s| s.as_ptr())
 }
 
+/// 1 if the notetype is cloze, 0 if standard, -1 on null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_is_cloze(schema: *const NotetypeSchema) -> i32 {
+    if schema.is_null() {
+        return -1;
+    }
+    let schema = &*schema;
+    if schema.is_cloze {
+        1
+    } else {
+        0
+    }
+}
+
+/// The notetype's sort-field index, or 0 on null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_notetype_sort_field_idx(schema: *const NotetypeSchema) -> u32 {
+    if schema.is_null() {
+        return 0;
+    }
+    let schema = &*schema;
+    schema.sort_field_idx
+}
+
+// ---------------------------------------------------------------------------
+// render_fields (ABI v4) — re-render a note from its notetype definition +
+// field values through the real Anki engine. When the user edits a note's
+// fields, the iOS half-renderer can't reproduce conditionals / filters / cloze;
+// instead we rebuild the notetype in a throwaway in-memory collection, add a
+// note with the edited values, and render its card(s) with rslib's own engine.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Clone)]
+struct TemplateDef {
+    name: String,
+    qfmt: String,
+    afmt: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct NotetypeDef {
+    name: String,
+    is_cloze: bool,
+    sort_field_idx: u32,
+    css: String,
+    fields: Vec<String>,
+    templates: Vec<TemplateDef>,
+}
+
+/// Rendered cards from `flashify_render_fields`: per-card ord + question/answer
+/// HTML, plus the shared notetype CSS. Column-oriented to match the other list
+/// accessors.
+pub struct RenderedFieldsList {
+    pub(crate) ords: Vec<u32>,
+    pub(crate) questions: Vec<CString>,
+    pub(crate) answers: Vec<CString>,
+    pub(crate) css: CString,
+}
+
+fn render_fields_inner(
+    def: NotetypeDef,
+    field_values: Vec<String>,
+) -> anki::error::Result<RenderedFieldsList> {
+    // Throwaway in-memory collection. Stock notetypes get auto-added but are
+    // harmless — we add and render our own notetype.
+    let mut col = CollectionBuilder::default().build()?;
+
+    // Rebuild the notetype from the stored schema.
+    let mut nt = Notetype {
+        id: NotetypeId(0),
+        name: def.name,
+        mtime_secs: TimestampSecs(0),
+        usn: Usn(0),
+        fields: def.fields.iter().map(NoteField::new).collect(),
+        templates: def
+            .templates
+            .iter()
+            .map(|t| CardTemplate::new(&t.name, &t.qfmt, &t.afmt))
+            .collect(),
+        config: NotetypeConfig {
+            css: def.css,
+            sort_field_idx: def.sort_field_idx,
+            kind: if def.is_cloze {
+                NotetypeKind::Cloze as i32
+            } else {
+                NotetypeKind::Normal as i32
+            },
+            ..Default::default()
+        },
+    };
+    col.add_notetype(&mut nt, true)?;
+
+    // Add a note with the edited field values (pad/truncate to field count).
+    let mut note = nt.new_note();
+    let field_count = note.fields().len();
+    for (idx, val) in field_values.into_iter().enumerate() {
+        if idx < field_count {
+            note.set_field(idx, val)?;
+        }
+    }
+    col.add_note(&mut note, DeckId(1))?;
+
+    // Render every generated card in template/cloze order.
+    let card_ids = col
+        .storage
+        .all_card_ids_of_note_in_template_order(note.id)?;
+    let to_cstring = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
+    let mut ords = Vec::with_capacity(card_ids.len());
+    let mut questions = Vec::with_capacity(card_ids.len());
+    let mut answers = Vec::with_capacity(card_ids.len());
+    let mut css = String::new();
+    // `all_card_ids_of_note_in_template_order` returns cards in ord order
+    // (template_idx for standard, cloze-deletion order for cloze), so the
+    // positional index IS the card ord — and `Card::template_idx` is private.
+    for (ord, cid) in card_ids.into_iter().enumerate() {
+        let out = col.render_existing_card(cid, false, false)?;
+        if css.is_empty() {
+            css = out.css.clone();
+        }
+        ords.push(ord as u32);
+        questions.push(to_cstring(&out.question()));
+        answers.push(to_cstring(&out.answer()));
+    }
+
+    Ok(RenderedFieldsList {
+        ords,
+        questions,
+        answers,
+        css: to_cstring(&css),
+    })
+}
+
+/// Render a note from a notetype definition + field values. `notetype_json` is
+/// a `NotetypeDef` (`{name, is_cloze, sort_field_idx, css, fields:[name],
+/// templates:[{name,qfmt,afmt}]}`); `field_values_json` is a JSON array of field
+/// values in notetype field order. Returns NULL on failure (check
+/// `flashify_last_error_message`); free with `flashify_free_rendered_fields`.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_render_fields(
+    notetype_json: *const c_char,
+    field_values_json: *const c_char,
+) -> *mut RenderedFieldsList {
+    let nt_str = match cstr_to_str(notetype_json) {
+        Some(s) => s,
+        None => {
+            set_last_error("flashify_render_fields: invalid notetype_json");
+            return ptr::null_mut();
+        }
+    };
+    let fv_str = match cstr_to_str(field_values_json) {
+        Some(s) => s,
+        None => {
+            set_last_error("flashify_render_fields: invalid field_values_json");
+            return ptr::null_mut();
+        }
+    };
+    let def: NotetypeDef = match serde_json::from_str(nt_str) {
+        Ok(d) => d,
+        Err(e) => {
+            set_last_error_from("flashify_render_fields: parse notetype_json", e);
+            return ptr::null_mut();
+        }
+    };
+    let field_values: Vec<String> = match serde_json::from_str(fv_str) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error_from("flashify_render_fields: parse field_values_json", e);
+            return ptr::null_mut();
+        }
+    };
+
+    match render_fields_inner(def, field_values) {
+        Ok(list) => Box::into_raw(Box::new(list)),
+        Err(e) => {
+            set_last_error_from("flashify_render_fields", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_free_rendered_fields(list: *mut RenderedFieldsList) {
+    if !list.is_null() {
+        drop(Box::from_raw(list));
+    }
+}
+
+/// Number of rendered cards, or -1 if `list` is null.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_fields_count(list: *const RenderedFieldsList) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    let list = &*list;
+    list.ords.len() as i64
+}
+
+/// Card ordinal at `idx` (Anki `template_idx`; cloze = deletion number - 1).
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_fields_ord_at(
+    list: *const RenderedFieldsList,
+    idx: u64,
+) -> u32 {
+    if list.is_null() {
+        return 0;
+    }
+    let list = &*list;
+    list.ords.get(idx as usize).copied().unwrap_or(0)
+}
+
+/// Question HTML at `idx`. Pointer valid until `flashify_free_rendered_fields`.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_fields_question_at(
+    list: *const RenderedFieldsList,
+    idx: u64,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    list.questions
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Answer HTML at `idx`. Pointer valid until `flashify_free_rendered_fields`.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_fields_answer_at(
+    list: *const RenderedFieldsList,
+    idx: u64,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    list.answers
+        .get(idx as usize)
+        .map_or(ptr::null(), |s| s.as_ptr())
+}
+
+/// Shared notetype CSS for the rendered cards. Never NULL for a non-null list.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_rendered_fields_css(
+    list: *const RenderedFieldsList,
+) -> *const c_char {
+    if list.is_null() {
+        return ptr::null();
+    }
+    let list = &*list;
+    list.css.as_ptr()
+}
+
 /// Status code for void operations. Zero = OK, non-zero = error (check
 /// `flashify_last_error_message`).
 #[no_mangle]
 pub extern "C" fn flashify_self_test() -> c_int {
     0
+}
+
+#[cfg(test)]
+mod render_fields_tests {
+    use super::*;
+
+    fn def(fields: &[&str], templates: &[(&str, &str, &str)], is_cloze: bool) -> NotetypeDef {
+        NotetypeDef {
+            name: "Test".into(),
+            is_cloze,
+            sort_field_idx: 0,
+            css: ".card{}".into(),
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+            templates: templates
+                .iter()
+                .map(|(n, q, a)| TemplateDef {
+                    name: n.to_string(),
+                    qfmt: q.to_string(),
+                    afmt: a.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Baseline: a Basic notetype renders front + back from field values.
+    #[test]
+    fn basic_renders_front_back() {
+        let d = def(
+            &["Front", "Back"],
+            &[("Card 1", "{{Front}}", "{{FrontSide}}<hr>{{Back}}")],
+            false,
+        );
+        let out = render_fields_inner(d, vec!["Q text".into(), "A text".into()]).unwrap();
+        assert_eq!(out.questions.len(), 1);
+        assert!(out.questions[0].to_str().unwrap().contains("Q text"));
+        assert!(out.answers[0].to_str().unwrap().contains("A text"));
+    }
+
+    /// THE point of going through rslib: a `{{#Field}}` conditional shows its
+    /// body only when the field is non-empty — the iOS half-renderer can't.
+    #[test]
+    fn conditional_field_renders() {
+        let d = def(
+            &["Front", "Extra"],
+            &[(
+                "Card 1",
+                "{{Front}}",
+                "{{Front}}{{#Extra}}<div id=ex>{{Extra}}</div>{{/Extra}}",
+            )],
+            false,
+        );
+        let with_extra = render_fields_inner(d.clone(), vec!["F".into(), "hint".into()]).unwrap();
+        assert!(with_extra.answers[0].to_str().unwrap().contains("hint"));
+        assert!(with_extra.answers[0].to_str().unwrap().contains("id=ex"));
+        let without = render_fields_inner(d, vec!["F".into(), "".into()]).unwrap();
+        assert!(
+            !without.answers[0].to_str().unwrap().contains("id=ex"),
+            "empty Extra must hide the conditional block"
+        );
+    }
+
+    /// Cloze: one card per `{{c1::}}/{{c2::}}` deletion, the active one hidden.
+    #[test]
+    fn cloze_generates_one_card_per_deletion() {
+        let d = def(
+            &["Text", "Extra"],
+            &[("Cloze", "{{cloze:Text}}", "{{cloze:Text}}<br>{{Extra}}")],
+            true,
+        );
+        let out = render_fields_inner(
+            d,
+            vec!["The {{c1::heart}} pumps {{c2::blood}}.".into(), "".into()],
+        )
+        .unwrap();
+        assert_eq!(out.questions.len(), 2, "two deletions → two cards");
+        let q0 = out.questions[0].to_str().unwrap();
+        let q1 = out.questions[1].to_str().unwrap();
+        // Each card masks its own active deletion as `[...]` and reveals the
+        // other inline as `cloze-inactive` — the exact Anki cloze behaviour the
+        // iOS half-renderer can't reproduce.
+        assert!(
+            q0.contains("[...]") && q0.contains("cloze-inactive"),
+            "c1 card masks its deletion, reveals the other"
+        );
+        assert!(
+            q1.contains("[...]") && q1.contains("cloze-inactive"),
+            "c2 card masks its deletion, reveals the other"
+        );
+        assert!(q0.contains(">blood<"), "c1 card reveals c2 = blood");
+        assert!(q1.contains(">heart<"), "c2 card reveals c1 = heart");
+    }
 }

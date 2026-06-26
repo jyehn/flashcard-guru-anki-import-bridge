@@ -186,6 +186,41 @@ fn main() -> ExitCode {
         }
     }
 
+    // Notetype schema dump — what the iOS CardEditCapability sees.
+    if let Some(nid) = sample.first() {
+        let ntid = col
+            .storage
+            .get_note(*nid)
+            .expect("get note")
+            .expect("note")
+            .notetype_id;
+        if let Ok(Some(nt)) = col.get_notetype(ntid) {
+            println!("\n=== notetype schema (id {}) ===", ntid.0);
+            println!("name: {}", nt.name);
+            println!(
+                "fields: {:?}",
+                nt.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>()
+            );
+            let unsupported_tokens = [
+                "{{#", "{{^", "{{/", "{{hint:", "{{type:", "{{tts", "{{furigana:",
+                "{{kana:", "{{kanji:", "{{Tags", "{{cloze:",
+            ];
+            for t in &nt.templates {
+                let combined = format!("{}\n{}", t.config.q_format, t.config.a_format);
+                let present: Vec<&str> = unsupported_tokens
+                    .iter()
+                    .filter(|tok| combined.contains(**tok))
+                    .copied()
+                    .collect();
+                println!("template '{}': flagged_tokens={:?}", t.name, present);
+                println!(
+                    "  qfmt[0..220]: {}",
+                    t.config.q_format.chars().take(220).collect::<String>().replace('\n', " ")
+                );
+            }
+        }
+    }
+
     // Media folder listing
     println!("\n=== collection.media listing ({}) ===", media_folder.display());
     print_dir(&media_folder, 30);
