@@ -213,11 +213,137 @@ impl FsrsState {
 //     + field values through the real Anki engine (a throwaway in-memory
 //     collection), so an edited card re-renders with full template support
 //     (conditionals, filters, cloze) instead of the iOS half-renderer.
-const ABI_VERSION: u32 = 4;
+// v5: owned per-card source history JSON, including queue and raw revlog.
+const ABI_VERSION: u32 = 5;
 
 #[no_mangle]
 pub extern "C" fn flashify_abi_version() -> u32 {
     ABI_VERSION
+}
+
+/// ABI v5: source scheduling and every revlog field, scoped to ONE card.
+/// Query under the collection mutex: rslib uses exclusive SQLite locking,
+/// so a separate Swift SQLite connection cannot safely read this collection.
+/// Owns the returned CString; caller must copy then free it with
+/// flashify_free_import_history_json (never libc free). NULL means failure,
+/// distinct from a valid card with an empty reviews array.
+#[no_mangle]
+pub unsafe extern "C" fn flashify_card_import_history_json(
+    pkg: *mut OpenedPackage,
+    card_id: u64,
+) -> *mut c_char {
+    if pkg.is_null() || card_id > i64::MAX as u64 {
+        set_last_error("flashify_card_import_history_json: invalid package or card id");
+        return ptr::null_mut();
+    }
+    let col = match (*pkg).collection.lock() {
+        Ok(col) => col,
+        Err(_) => {
+            set_last_error("flashify_card_import_history_json: poisoned mutex");
+            return ptr::null_mut();
+        }
+    };
+    match read_import_history(col.storage.db(), card_id as i64) {
+        Ok(value) => match CString::new(value.to_string()) {
+            Ok(json) => json.into_raw(),
+            Err(e) => {
+                set_last_error_from("flashify_card_import_history_json: encode", e);
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_last_error_from("flashify_card_import_history_json: query", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn flashify_free_import_history_json(json: *mut c_char) {
+    if !json.is_null() {
+        drop(CString::from_raw(json));
+    }
+}
+
+fn read_import_history(
+    db: &rusqlite::Connection,
+    card_id: i64,
+) -> rusqlite::Result<serde_json::Value> {
+    let card = db.query_row(
+        "SELECT nid,ord,type,queue,due,ivl,reps,lapses FROM cards WHERE id=?",
+        [card_id],
+        |row| {
+            (0..8)
+                .map(|i| row.get::<_, i64>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        },
+    )?;
+    let created: i64 = db.query_row("SELECT crt FROM col LIMIT 1", [], |row| row.get(0))?;
+    let mut query = db.prepare_cached(
+        "SELECT id,cid,usn,ease,ivl,lastIvl,factor,time,type FROM revlog WHERE cid=? ORDER BY id",
+    )?;
+    let reviews = query
+        .query_map([card_id], |row| {
+            let v = (0..9)
+                .map(|i| row.get::<_, i64>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(serde_json::json!({
+                "id": v[0], "cardId": v[1], "usn": v[2], "ease": v[3],
+                "interval": v[4], "lastInterval": v[5], "factor": v[6], "time": v[7], "type": v[8]
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    Ok(serde_json::json!({
+        "cardId": card_id, "noteId": card[0], "ord": card[1], "type": card[2],
+        "queue": card[3], "due": card[4], "interval": card[5], "reps": card[6], "lapses": card[7],
+        "collectionCreatedAt": created, "importedAt": now, "reviews": reviews
+    }))
+}
+
+#[cfg(test)]
+mod import_history_tests {
+    use super::*;
+
+    #[test]
+    fn history_is_scoped_by_card_and_retains_suspension_and_raw_manual_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE col(crt); INSERT INTO col VALUES(1700000000);
+            CREATE TABLE cards(id,nid,ord,type,queue,due,ivl,reps,lapses);
+            INSERT INTO cards VALUES(101,100,0,2,-1,3,7,1,0),(102,100,1,1,1,1800000060,0,2,1),(103,100,2,0,0,1,0,0,0);
+            CREATE TABLE revlog(id,cid,usn,ease,ivl,lastIvl,factor,time,type);
+            INSERT INTO revlog VALUES(1700000000001,101,-1,3,-60,0,2500,2345,0),
+              (1700000000002,101,-1,0,7,-60,0,0,4),(1700000000003,102,-1,4,7,-60,2500,2000,1);").unwrap();
+        let first = read_import_history(&db, 101).unwrap();
+        assert_eq!(first["queue"], -1);
+        assert_eq!(first["ord"], 0);
+        assert_eq!(first["reviews"].as_array().unwrap().len(), 2);
+        assert_eq!(first["reviews"][0]["id"], 1700000000001_i64);
+        assert_eq!(first["reviews"][0]["interval"], -60);
+        assert_eq!(first["reviews"][0]["time"], 2345);
+        assert_eq!(first["reviews"][1]["type"], 4);
+        let second = read_import_history(&db, 102).unwrap();
+        assert_eq!(second["queue"], 1);
+        assert_eq!(second["due"], 1800000060);
+        assert_eq!(second["reviews"].as_array().unwrap().len(), 1);
+        assert_eq!(second["reviews"][0]["cardId"], 102);
+        assert_eq!(
+            read_import_history(&db, 103).unwrap()["reviews"],
+            serde_json::json!([])
+        );
+        assert!(read_import_history(&db, 999).is_err());
+    }
+
+    #[test]
+    fn null_handle_and_null_free_are_safe() {
+        unsafe {
+            assert!(flashify_card_import_history_json(ptr::null_mut(), 1).is_null());
+            flashify_free_import_history_json(ptr::null_mut());
+        }
+    }
 }
 
 /// Smoke-test helper: returns rslib's own version string. The Swift bridge

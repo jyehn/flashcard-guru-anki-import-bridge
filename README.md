@@ -237,6 +237,19 @@ Move the phase to the aggregate target as described above.
 
 ## FFI surface
 
+### ABI v5: imported history and queue
+
+`flashify_card_import_history_json(pkg, card_id)` returns one owned UTF-8 JSON
+snapshot containing card/note/ordinal identity, type/queue/due/interval/reps/lapses,
+collection creation and import timestamps, and all nine revlog columns per row.
+Release it with `flashify_free_import_history_json`, never libc `free`.
+NULL means a read error; `reviews: []` means a successful read with no history.
+The collection's existing mutex/SQLite connection is used: rslib holds an
+exclusive lock, so external SQLite readers cannot safely inspect its database.
+The payload is one card at a time, with no duplicated note fields or templates.
+Clients must treat these rows as imported history, not new rating mutations to
+replay over an already-imported scheduling baseline.
+
 All functions live in [`src/lib.rs`](src/lib.rs). The cbindgen-generated
 header is a build artifact; refer to the Rust source for the
 authoritative definitions.
@@ -245,7 +258,7 @@ authoritative definitions.
 
 | Function | Returns | Use |
 |---|---|---|
-| `flashify_abi_version()` | `u32` | Currently `1`. Swift bridge checks this at `openPackage` and throws `BridgeError.unsupportedAbi` on mismatch. **Bump when the FFI signatures change.** |
+| `flashify_abi_version()` | `u32` | Currently `5`. Swift bridge checks this at `openPackage` and rejects a mismatch. **Bump when the FFI contract changes.** |
 | `flashify_anki_version()` | `*const c_char` | rslib's own version string (e.g. `"25.10b1"`). Diagnostic only. |
 | `flashify_self_test()` | `c_int` | Returns 0. Smoke probe. |
 
