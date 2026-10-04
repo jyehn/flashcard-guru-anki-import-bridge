@@ -42,16 +42,20 @@
 //! - Strings: Java strings come in through `GetStringUTFChars` and are decoded
 //!   from modified UTF-8 by the `jni` crate; JSON goes out as plain UTF-8 bytes;
 //!   the few small strings returned directly are encoded by the `jni` crate.
-//! - Temp files: rslib copies the package's collection into a `NamedTempFile` in
-//!   `std::env::temp_dir()`. Android sets no TMPDIR and the fallback
-//!   `/data/local/tmp` is not writable for apps, so Kotlin must call `nativeInit`
-//!   with the app's cache directory once, before the first `nativeOpenPackage`.
+//! - Temp files: rslib copies the package's collection into a `NamedTempFile`
+//!   created through `tempfile::env::temp_dir()`. Android sets no TMPDIR and the
+//!   fallback `/data/local/tmp` is not writable for apps, so Kotlin must call
+//!   `nativeInit` with the app's cache directory once, before the first
+//!   `nativeOpenPackage`. It points tempfile's process-wide override there (no
+//!   `setenv`: the app process is multi-threaded and C code reads the environment
+//!   without Rust's lock). The directory lives under the app cache, which Android
+//!   may clear while the process runs, so every open re-creates it.
 
 use std::any::Any;
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
@@ -345,6 +349,9 @@ struct RenderedFieldsJson {
 // Core operations. Each mirrors one C ABI function in lib.rs line for line.
 // ---------------------------------------------------------------------------
 
+/// The directory `nativeInit` pointed rslib's temp files at. Set once per process.
+static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 fn init(temp_dir: &str) -> BridgeResult<String> {
     if temp_dir.is_empty() {
         return Err("nativeInit: empty temp dir".to_string());
@@ -354,14 +361,45 @@ fn init(temp_dir: &str) -> BridgeResult<String> {
     let probe = dir.join(format!(".rust-import-probe-{}", std::process::id()));
     std::fs::write(&probe, b"").map_err(|e| format!("nativeInit: {temp_dir} not writable: {e}"))?;
     let _ = std::fs::remove_file(&probe);
-    // Process-global. Kotlin calls this once, right after loading the library and
-    // before any import thread exists.
-    std::env::set_var("TMPDIR", &dir);
-    Ok(std::env::temp_dir().to_string_lossy().into_owned())
+    // Process-global, first call wins. tempfile's override instead of
+    // `std::env::set_var("TMPDIR")`: setenv while other threads (WebView, Room,
+    // OkHttp, C code calling getenv) run is undefined behaviour. rslib's
+    // `new_tempfile()` resolves through `tempfile::env::temp_dir()`, and the
+    // bundled SQLite keeps its temp store in memory on Android, so nothing else
+    // needs TMPDIR.
+    match tempfile::env::override_temp_dir(&dir) {
+        Ok(()) => {}
+        Err(existing) if existing == dir => {}
+        Err(existing) => {
+            return Err(format!(
+                "nativeInit: temp dir already set to {}",
+                existing.to_string_lossy()
+            ))
+        }
+    }
+    let _ = TEMP_DIR.set(dir);
+    Ok(tempfile::env::temp_dir().to_string_lossy().into_owned())
+}
+
+/// Re-creates the temp directory before rslib needs it. It sits under the app's
+/// cache directory, which "Clear cache" and the system's low-storage trimming
+/// delete while the process keeps running; `NamedTempFile::new()` never creates a
+/// missing parent, so every later import would fail with ENOENT.
+fn ensure_temp_dir() -> BridgeResult<()> {
+    match TEMP_DIR.get() {
+        Some(dir) => std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "flashify_open_package: create temp dir {}: {e}",
+                dir.to_string_lossy()
+            )
+        }),
+        None => Ok(()),
+    }
 }
 
 /// `flashify_open_package`.
 fn open_package(package_path: &str, workspace_path: &str) -> BridgeResult<OpenedPackage> {
+    ensure_temp_dir()?;
     let (work_dir, col_path, media_folder, media_db) = prepare_workspace(Path::new(workspace_path))
         .map_err(|e| format!("flashify_open_package: prepare workspace: {e}"))?;
     let mut guard = WorkDirGuard(Some(work_dir.clone()));
@@ -937,7 +975,7 @@ pub extern "system" fn Java_com_guruowl_android_core_ankibridge_NativeBridge_nat
     })
 }
 
-/// Sets TMPDIR for rslib's temp files; returns `std::env::temp_dir()` after.
+/// Points rslib's temp files at `tempDir`; returns the directory tempfile now uses.
 #[no_mangle]
 pub extern "system" fn Java_com_guruowl_android_core_ankibridge_NativeBridge_nativeInit<'local>(
     mut env: JNIEnv<'local>,

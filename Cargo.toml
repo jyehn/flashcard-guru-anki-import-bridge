@@ -26,7 +26,7 @@ native-tls = ["anki/native-tls"]
 rustls = ["anki/rustls"]
 # Android build: rustls (no OpenSSL) plus the JNI layer in src/android_jni.rs.
 # Build with `--no-default-features --features android`.
-android = ["rustls", "dep:jni"]
+android = ["rustls", "dep:jni", "dep:tempfile"]
 
 [dependencies]
 # rslib is large and uses native-tls for its sync layer. We don't use sync, but
@@ -49,6 +49,9 @@ serde = { version = "1", features = ["derive"] }
 
 # JNI bindings for the Android build only (feature `android`).
 jni = { version = "0.21", optional = true }
+# Android only: `nativeInit` points rslib's temp files at the app cache through
+# tempfile's process-wide override instead of setenv. Same version rslib locks.
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 regex = "1"
