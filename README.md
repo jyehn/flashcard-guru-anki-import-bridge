@@ -340,13 +340,14 @@ of them is undefined behaviour from Swift's side.
 These bit us during development. Reading them now saves you the same
 debugging session.
 
-### `native-tls` feature is required
+### A TLS feature is required
 
-`anki = { path = "...", features = ["native-tls"] }` in `Cargo.toml`
-isn't optional even though we never touch rslib's sync layer. Without
-it, `cargo check -p anki` fails on type inference inside
-`async-compression-0.4.30` because `reqwest` defaults to a TLS-less
+rslib needs one TLS backend to type-check even though we never touch its
+sync layer. Without one, `cargo check -p anki` fails on type inference
+inside `async-compression` because `reqwest` defaults to a TLS-less
 configuration and the trait bounds for `tokio::bufread` don't resolve.
+The crate's default feature `native-tls` keeps the iOS build exactly as
+before; the Android build selects `rustls` instead (see "Android").
 
 ### Rust 1.92.0 pinned
 
@@ -447,6 +448,50 @@ Caching `~/.cargo/registry`, `~/.cargo/git`, and
 ~30s. The `Vendor/anki-rs/.git/modules` directory and the resolved
 submodule contents are also worth caching.
 
+## Android
+
+The same crate builds as an Android JNI library, `librust_import_core.so`.
+Nothing about the iOS build changes: the default features, `crate-type`,
+the C ABI and the generated header (byte-identical) stay as they are.
+
+```bash
+# Once: rustup target add aarch64-linux-android --toolchain 1.92.0
+# Needs NDK 27.1.12297006 (or ANDROID_NDK_HOME) and protoc.
+scripts/build-android.sh [OUTPUT_JNILIBS_DIR]   # default android/jniLibs/<abi>/
+```
+
+- `--no-default-features --features android`: rslib with `rustls` (no
+  OpenSSL; `native-tls` cannot cross-compile without one) plus the JNI
+  layer in [`src/android_jni.rs`](src/android_jni.rs), with the `jni`
+  crate as an optional dependency.
+- `cargo rustc --crate-type cdylib`: the shared library is requested on
+  the command line, so `Cargo.toml` keeps `crate-type = ["staticlib"]`.
+- 16 KB ELF segment alignment (`-z max-page-size=16384`,
+  `common-page-size=16384`), which Play requires for apps targeting
+  Android 15+ and NDK r27 does not do by default. The script prints
+  `llvm-readelf -l` and fails if a LOAD segment is aligned below 16 KB.
+- Only `arm64-v8a` is built and verified so far. `x86_64` and
+  `armeabi-v7a` are mapped in the script but untested; a CI job that
+  publishes `jniLibs` next to the xcframework is still to do.
+- `systemstat` is locked at 0.2.5 (the version anki-rs 7d8dc017 itself
+  locks): 0.2.6, pulled by fsrs → burn → burn-train, does not compile for
+  `target_os = "android"`. Its Apple sources are identical in both
+  versions.
+
+The JNI layer exposes coarse calls (open a package, deck list, paged
+notes, render a batch of notes with scheduler state and history,
+notetype schema, render_fields, close) that return UTF-8 JSON as
+`byte[]`. It repeats the C functions' bodies as `Result`-returning Rust,
+because a panic cannot be caught once it reaches an `extern "C"` frame;
+every JNI entry point catches panics and throws a Java exception instead.
+`nativeCompareWithCAbi` reads one package through both paths so drift is
+testable on a device. The Java binding class is
+`com.guruowl.android.core.ankibridge.NativeBridge`; the module comment of
+`src/android_jni.rs` documents handles, threading, strings and the
+TMPDIR requirement (rslib's apkg import writes a temp file to
+`std::env::temp_dir()`, which is not writable for Android apps unless
+the app sets TMPDIR through `nativeInit`).
+
 ## See also
 
 - [`Vendor/RustImportCore/src/lib.rs`](src/lib.rs) — the FFI source.
@@ -466,7 +511,7 @@ submodule contents are also worth caching.
 This crate currently depends on Anki's `rslib` via a relative path:
 
 ```toml
-anki = { path = "../anki-rs/rslib", features = ["native-tls"] }
+anki = { path = "../anki-rs/rslib" }   # TLS backend chosen by this crate's features
 ```
 
 So a standalone clone needs Anki at `../anki-rs/`:

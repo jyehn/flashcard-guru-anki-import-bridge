@@ -41,6 +41,12 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
 
+// Android only: JNI entry points over the same rslib calls the C ABI below uses.
+// Not compiled for iOS (default features), and cbindgen skips its
+// `extern "system"` functions, so the iOS header is unchanged.
+#[cfg(feature = "android")]
+mod android_jni;
+
 // ---------------------------------------------------------------------------
 // Error storage. Uses a global mutex; the bridge actor on the Swift side
 // already serialises calls per-package, so contention is essentially zero.
