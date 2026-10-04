@@ -455,10 +455,17 @@ Nothing about the iOS build changes: the default features, `crate-type`,
 the C ABI and the generated header (byte-identical) stay as they are.
 
 ```bash
-# Once: rustup target add aarch64-linux-android --toolchain 1.92.0
+# Once: rustup target add aarch64-linux-android x86_64-linux-android \
+#         armv7-linux-androideabi --toolchain 1.92.0
 # Needs NDK 27.1.12297006 (or ANDROID_NDK_HOME) and protoc.
 scripts/build-android.sh [OUTPUT_JNILIBS_DIR]   # default android/jniLibs/<abi>/
+ANDROID_ABIS=arm64-v8a scripts/build-android.sh  # one ABI only
 ```
+
+Output: `<abi>/librust_import_core.so` for `arm64-v8a`, `x86_64` and
+`armeabi-v7a`, plus `SHA256SUMS` and `BUILD-INFO` (commit, rustc, NDK, API).
+Tagged releases attach the same tree as `RustImportCore-android-jniLibs.zip`
+(job `android` in `.github/workflows/release.yml`).
 
 - `--no-default-features --features android`: rslib with `rustls` (no
   OpenSSL; `native-tls` cannot cross-compile without one) plus the JNI
@@ -466,13 +473,22 @@ scripts/build-android.sh [OUTPUT_JNILIBS_DIR]   # default android/jniLibs/<abi>/
   crate as an optional dependency.
 - `cargo rustc --crate-type cdylib`: the shared library is requested on
   the command line, so `Cargo.toml` keeps `crate-type = ["staticlib"]`.
-- 16 KB ELF segment alignment (`-z max-page-size=16384`,
-  `common-page-size=16384`), which Play requires for apps targeting
-  Android 15+ and NDK r27 does not do by default. The script prints
-  `llvm-readelf -l` and fails if a LOAD segment is aligned below 16 KB.
-- Only `arm64-v8a` is built and verified so far. `x86_64` and
-  `armeabi-v7a` are mapped in the script but untested; a CI job that
-  publishes `jniLibs` next to the xcframework is still to do.
+- 16 KB ELF segment alignment on the 64-bit ABIs (`-z max-page-size=16384`,
+  `common-page-size=16384`), which Play requires on 64-bit devices for
+  apps targeting Android 15+ and NDK r27 does not do by default.
+  `armeabi-v7a` keeps 4 KB, as NDK r28+ does: 16 KB pages exist only for
+  64-bit ABIs.
+- `DT_SONAME` is set, and `--remap-path-prefix` replaces the build
+  machine's paths in panic locations (`/cargo/...`, `/build/...`). The
+  bridge checkout's location, the target dir and `CARGO_HOME` then no
+  longer change the bytes; the absolute path of `../anki-rs` still does
+  (Cargo hashes the path of a path dependency outside the workspace into
+  crate metadata), so a CI build and a local build differ unless anki-rs
+  sits at the same absolute path.
+- After each build the script checks the ELF and stops on a failure:
+  LOAD alignment, SONAME, no text relocations, `NEEDED` only from libc,
+  libm, libdl, liblog and libandroid, every strong undefined symbol
+  defined by those NDK stubs at API 26, no `setenv`, `Java_` exports.
 - `systemstat` is locked at 0.2.5 (the version anki-rs 7d8dc017 itself
   locks): 0.2.6, pulled by fsrs → burn → burn-train, does not compile for
   `target_os = "android"`. Its Apple sources are identical in both
@@ -487,10 +503,10 @@ every JNI entry point catches panics and throws a Java exception instead.
 `nativeCompareWithCAbi` reads one package through both paths so drift is
 testable on a device. The Java binding class is
 `com.guruowl.android.core.ankibridge.NativeBridge`; the module comment of
-`src/android_jni.rs` documents handles, threading, strings and the
-TMPDIR requirement (rslib's apkg import writes a temp file to
-`std::env::temp_dir()`, which is not writable for Android apps unless
-the app sets TMPDIR through `nativeInit`).
+`src/android_jni.rs` documents handles, threading, strings and temp
+files (rslib's apkg import writes a temp file through tempfile, whose
+default directory is not writable for Android apps; `nativeInit` points
+tempfile's process-wide override at the app's cache, without `setenv`).
 
 ## See also
 
