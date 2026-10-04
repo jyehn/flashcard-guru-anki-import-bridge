@@ -87,3 +87,101 @@ jobs:
             RustImportCore.xcframework.zip
             RustImportCore.xcframework.zip.sha256
           retention-days: 7
+
+  # Android JNI libraries (librust_import_core.so for arm64-v8a, x86_64, armeabi-v7a),
+  # attached to the same release. It waits for the xcframework job so that only one job
+  # creates the GitHub Release. Runs on macOS with the same rustc, NDK and protoc as the
+  # local builds. Its bytes still differ from a local build, because anki-rs sits at
+  # another absolute path (see scripts/build-android.sh): the app pins the sha256 of
+  # the release artifact after testing that artifact on a device.
+  android:
+    name: Build and release Android jniLibs
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+
+    env:
+      ANKI_REV: 7d8dc01722b4b6dfbea83df6cc38f0fbaf0fdbf1
+      RUST_TOOLCHAIN: 1.92.0
+      NDK_VERSION: 27.1.12297006
+      PROTOC_VERSION: '33.4'
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+
+      - name: Clone anki-rs as sibling
+        run: |
+          set -euxo pipefail
+          PARENT="$(dirname "$GITHUB_WORKSPACE")"
+          cd "$PARENT"
+          git clone https://github.com/ankitects/anki anki-rs
+          cd anki-rs
+          git checkout "$ANKI_REV"
+          git submodule update --init --recursive ftl/core-repo ftl/qt-repo
+
+      - name: Install protoc (pinned)
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-aarch_64.zip"
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "PROTOC=$RUNNER_TEMP/protoc/bin/protoc" >> "$GITHUB_ENV"
+
+      - name: Rust toolchain and Android targets
+        run: |
+          set -euxo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-linux-android \
+            --target x86_64-linux-android \
+            --target armv7-linux-androideabi
+
+      - name: Android NDK
+        run: |
+          set -euxo pipefail
+          test -n "${ANDROID_HOME:-}" || { echo "ANDROID_HOME is not set on this runner"; exit 1; }
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION"
+          grep -q "Pkg.Revision = $NDK_VERSION" "$ANDROID_HOME/ndk/$NDK_VERSION/source.properties"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Show toolchain
+        run: |
+          rustc "+$RUST_TOOLCHAIN" --version
+          "$PROTOC" --version
+          cat "$ANDROID_NDK_HOME/source.properties"
+
+      # Builds all three ABIs and fails on any ELF check (16 KB LOAD alignment on the
+      # 64-bit ABIs, SONAME, no text relocations, NEEDED libraries, undefined symbols).
+      - name: Build jniLibs
+        run: ./scripts/build-android.sh "$GITHUB_WORKSPACE/jniLibs"
+
+      - name: Zip + checksum
+        run: |
+          set -euxo pipefail
+          (cd jniLibs && zip -qrX ../RustImportCore-android-jniLibs.zip .)
+          shasum -a 256 RustImportCore-android-jniLibs.zip > RustImportCore-android-jniLibs.zip.sha256
+          cat jniLibs/BUILD-INFO jniLibs/SHA256SUMS RustImportCore-android-jniLibs.zip.sha256
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            RustImportCore-android-jniLibs.zip
+            RustImportCore-android-jniLibs.zip.sha256
+          fail_on_unmatched_files: true
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustImportCore-android-jniLibs-${{ github.run_id }}
+          path: |
+            RustImportCore-android-jniLibs.zip
+            RustImportCore-android-jniLibs.zip.sha256
+          retention-days: 7
